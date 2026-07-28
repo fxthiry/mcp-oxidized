@@ -9,6 +9,8 @@
 
 use super::fixtures::{MockNode, MockVersion};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -29,6 +31,9 @@ pub struct MockOxidizedServer {
     nodes: Vec<MockNode>,
     versions: HashMap<String, Vec<MockVersion>>,
     configs: HashMap<String, String>,
+    node_show_sequences: HashMap<String, Vec<MockNode>>,
+    config_sequences: HashMap<String, Vec<String>>,
+    version_configs: HashMap<(String, String), String>,
 }
 
 impl MockOxidizedServer {
@@ -40,6 +45,9 @@ impl MockOxidizedServer {
             nodes: vec![],
             versions: HashMap::new(),
             configs: HashMap::new(),
+            node_show_sequences: HashMap::new(),
+            config_sequences: HashMap::new(),
+            version_configs: HashMap::new(),
         }
     }
 
@@ -66,6 +74,36 @@ impl MockOxidizedServer {
     #[must_use]
     pub fn with_configs(mut self, configs: HashMap<String, String>) -> Self {
         self.configs = configs;
+        self
+    }
+
+    /// Return successive node states from `/node/show/{name}.json`.
+    ///
+    /// The last state is repeated after the sequence is exhausted. This models
+    /// pending, completed, failed, unchanged, and changed backup runs.
+    #[must_use]
+    pub fn with_node_show_sequence(mut self, node: &str, states: Vec<MockNode>) -> Self {
+        assert!(!states.is_empty(), "node state sequence must not be empty");
+        self.node_show_sequences.insert(node.to_string(), states);
+        self
+    }
+
+    /// Return successive current configurations, repeating the final value.
+    #[must_use]
+    pub fn with_config_sequence(mut self, node: &str, configs: Vec<String>) -> Self {
+        assert!(
+            !configs.is_empty(),
+            "configuration sequence must not be empty"
+        );
+        self.config_sequences.insert(node.to_string(), configs);
+        self
+    }
+
+    /// Configure the exact content returned for one historical version.
+    #[must_use]
+    pub fn with_version_config(mut self, node: &str, oid: &str, config: &str) -> Self {
+        self.version_configs
+            .insert((node.to_string(), oid.to_string()), config.to_string());
         self
     }
 
@@ -130,11 +168,25 @@ impl MockOxidizedServer {
         // Mount endpoints for each known node
         for node in &self.nodes {
             let path_str = format!("/node/show/{}.json", node.name);
-            Mock::given(method("GET"))
-                .and(path(&path_str))
-                .respond_with(ResponseTemplate::new(200).set_body_json(node))
-                .mount(&self.inner)
-                .await;
+            if let Some(states) = self.node_show_sequences.get(&node.name) {
+                let states = states.clone();
+                let calls = Arc::new(AtomicUsize::new(0));
+                Mock::given(method("GET"))
+                    .and(path(&path_str))
+                    .respond_with(move |_request: &wiremock::Request| {
+                        let index = calls.fetch_add(1, Ordering::Relaxed);
+                        let state = &states[index.min(states.len() - 1)];
+                        ResponseTemplate::new(200).set_body_json(state)
+                    })
+                    .mount(&self.inner)
+                    .await;
+            } else {
+                Mock::given(method("GET"))
+                    .and(path(&path_str))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(node))
+                    .mount(&self.inner)
+                    .await;
+            }
         }
 
         // Mount catch-all for unknown nodes - HTTP 500 (API quirk!)
@@ -172,34 +224,60 @@ impl MockOxidizedServer {
             .await;
     }
 
-    /// Mount GET /node/fetch/{name} - get current config (no .json extension)
+    /// Mount GET /node/fetch/{group}/{name} - get current config (no .json extension)
     async fn mount_node_config_endpoints(&self) {
         for (node_name, config) in &self.configs {
-            let path_str = format!("/node/fetch/{}", node_name);
+            let full_name = self
+                .nodes
+                .iter()
+                .find(|node| &node.name == node_name)
+                .map(|node| node.full_name.as_str())
+                .unwrap_or(node_name);
+            let path_str = format!("/node/fetch/{}", full_name);
             // Oxidized returns raw text, not JSON
-            Mock::given(method("GET"))
-                .and(path(&path_str))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_string(config)
-                        .insert_header("content-type", "text/plain"),
-                )
-                .mount(&self.inner)
-                .await;
+            if let Some(configs) = self.config_sequences.get(node_name) {
+                let configs = configs.clone();
+                let calls = Arc::new(AtomicUsize::new(0));
+                Mock::given(method("GET"))
+                    .and(path(&path_str))
+                    .respond_with(move |_request: &wiremock::Request| {
+                        let index = calls.fetch_add(1, Ordering::Relaxed);
+                        ResponseTemplate::new(200)
+                            .set_body_string(&configs[index.min(configs.len() - 1)])
+                            .insert_header("content-type", "text/plain")
+                    })
+                    .mount(&self.inner)
+                    .await;
+            } else {
+                Mock::given(method("GET"))
+                    .and(path(&path_str))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(config)
+                            .insert_header("content-type", "text/plain"),
+                    )
+                    .mount(&self.inner)
+                    .await;
+            }
         }
 
         // Catch-all for unknown nodes returns 500 (same as show)
-        let known_nodes: Vec<String> = self.configs.keys().cloned().collect();
+        let known_nodes: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|node| self.configs.contains_key(&node.name))
+            .map(|node| node.full_name.clone())
+            .collect();
         Mock::given(method("GET"))
-            .and(path_regex(r"^/node/fetch/[^/]+$"))
+            .and(path_regex(r"^/node/fetch/.+$"))
             .respond_with(move |req: &wiremock::Request| {
                 let path = req.url.path();
-                let name = path.strip_prefix("/node/fetch/").unwrap_or("unknown");
+                let full_name = path.strip_prefix("/node/fetch/").unwrap_or("unknown");
 
-                if known_nodes.contains(&name.to_string()) {
+                if known_nodes.contains(&full_name.to_string()) {
                     ResponseTemplate::new(200)
                 } else {
-                    let error_body = format!("unable to find '{}'", name);
+                    let error_body = format!("unable to find '{}'", full_name);
                     ResponseTemplate::new(500).set_body_string(error_body)
                 }
             })
@@ -235,13 +313,16 @@ impl MockOxidizedServer {
                 for version in versions {
                     // Get config content for this version
                     let config = self
-                        .configs
-                        .get(node_name)
-                        .map(|c| c.as_str())
+                        .version_configs
+                        .get(&(node_name.clone(), version.oid.clone()))
+                        .or_else(|| self.configs.get(node_name))
+                        .map(|config| config.as_str())
                         .unwrap_or("no config");
 
                     // Oxidized returns JSON array of lines
-                    let lines: Vec<&str> = config.lines().collect();
+                    // The real endpoint retains line terminators; the client
+                    // joins the returned array verbatim.
+                    let lines: Vec<&str> = config.split_inclusive('\n').collect();
 
                     Mock::given(method("GET"))
                         .and(path("/node/version/view.json"))

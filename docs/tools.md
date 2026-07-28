@@ -1,271 +1,144 @@
 # Tools Reference
 
-This document describes all MCP tools provided by mcp-oxidized.
+All v2 tools return both concise text and MCP `structuredContent`. Discovery
+includes an output schema and annotations identifying read-only and mutating
+operations. Existing `oxidized://` resources remain supported, but tools are
+recommended for typed discovery and composition.
 
-## Overview
+## Read tools
 
-| Tool | Description |
-|------|-------------|
-| [`fetch_node_config`](#fetch_node_config) | Trigger immediate backup of a node |
-| [`prioritize_node`](#prioritize_node) | Move node to front of backup queue |
-| [`reload_sources`](#reload_sources) | Reload Oxidized source inventory |
-| [`diff_configs`](#diff_configs) | Compare two configuration versions |
-| [`search_configs`](#search_configs) | Search patterns across configurations |
+| Tool | Parameters | Purpose |
+|------|------------|---------|
+| `list_nodes` | `offset=0`, `limit=100`, `group?`, `name_pattern?`, `model?`, `status?` | Filter and paginate nodes in deterministic name order |
+| `get_node` | `node` | Return one node and cache freshness |
+| `get_node_config` | `node`, `mode=full`, `start_line?`, `end_line?`, `truncate_head?`, `truncate_tail?`, `force_refresh=false` | Read a current configuration |
+| `list_config_versions` | `node`, `offset=0`, `limit=100` | List versions newest first |
+| `get_config_version` | `node`, `oid` | Read a historical version |
+| `diff_latest` | `node` | Compare the newest two versions |
+| `diff_configs` | `node`, `version1`, `version2` | Compare selected versions |
+| `search_configs` | See below | Search configurations |
+| `get_backup_status` | `operation_id` | Poll a tracked backup |
 
----
+`get_node_config` modes are:
 
-## fetch_node_config
+- `full`: return the configuration, optionally preserving a requested number
+  of head and tail lines.
+- `summary`: return detected configuration sections and size information.
+- `lines`: return the inclusive, one-based `start_line`/`end_line` range.
 
-Triggers an immediate backup of a node's configuration. This is useful when you need fresh data after making changes to a device.
+`force_refresh=true` bypasses the configuration cache. Every cache-bearing
+response includes `metadata.cache_hit` and `metadata.fresh`.
 
-### Parameters
+## Searching configurations
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `node` | string | Yes | The node name to backup |
+`search_configs` accepts:
 
-### Example
+| Parameter | Default | Limit | Meaning |
+|-----------|---------|-------|---------|
+| `pattern` | required | non-empty | Rust regex, or plain text when `literal=true` |
+| `nodes` | all | existing nodes | Optional search scope |
+| `case_sensitive` | `true` | — | Case-sensitive matching |
+| `literal` | `false` | — | Escape regex metacharacters |
+| `context_before` | `1` | 0–50 | Context lines before a match |
+| `context_after` | `1` | 0–50 | Context lines after a match |
+| `limit_per_node` | none | 1–1000 | Matching-line cap per node |
+| `offset` | `0` | non-negative | Global matching-line offset |
+| `limit` | `100` | 1–1000 | Global matching-line page size |
 
-**Request:**
+Results are ordered by node name and line number. Adjacent matching lines are
+merged into one block without repeating context. Pagination metadata includes
+`total_matches`, `shown_matches`, `offset`, `limit`, and `has_more`.
+
+The counters have distinct meanings:
+
+- `nodes_searched`: valid nodes in the requested scope.
+- `configs_fetched`: configurations downloaded after server-side prefiltering.
+- `nodes_with_matches`: nodes with matches before global pagination.
+- `nodes_returned`: nodes represented on this page.
+
+If Oxidized's optional `conf_search` endpoint is unavailable, the tool warns and
+falls back to fetching the scoped configurations. A successful prefilter with
+zero candidates is treated as a trustworthy zero-match result.
+
+Example:
+
+```json
+{
+  "name": "search_configs",
+  "arguments": {
+    "pattern": "authentication-key",
+    "literal": true,
+    "context_before": 2,
+    "context_after": 2,
+    "offset": 0,
+    "limit": 50,
+    "limit_per_node": 10
+  }
+}
+```
+
+Search runs against raw configuration text, then masks returned match and
+context lines. This allows callers to find secret directives without receiving
+the values.
+
+## Tracked backups
+
+### fetch_node_config
+
+Parameters are `node`, `wait=false`, and `timeout_seconds=60` (1–300).
+The response contains an operation ID, baseline and latest backup metadata,
+completion state, Oxidized status, and `mtime_changed`.
+
+With `wait=false`, poll using `get_backup_status`:
+
 ```json
 {
   "name": "fetch_node_config",
-  "arguments": {
-    "node": "router-core-01"
+  "arguments": {"node": "router-core-01", "wait": false}
+}
+```
+
+```json
+{
+  "name": "get_backup_status",
+  "arguments": {"operation_id": "backup-operation-id"}
+}
+```
+
+With `wait=true`, the call polls until the new run succeeds, fails, or times
+out. A newer completed run counts as completion even if its configuration and
+`mtime` are unchanged. Pending nodes bypass the configuration cache.
+
+### fetch_node_configs
+
+Queues 1–20 unique nodes. `concurrency` defaults to 5 and must be 1–10.
+`wait` and `timeout_seconds` have the same meaning as the single-node tool.
+Operations and aggregate completed/failed/pending counts are returned in
+deterministic node order.
+
+## Other write tools
+
+| Tool | Parameters | Purpose |
+|------|------------|---------|
+| `prioritize_node` | `node` | Move a node to the front of the Oxidized queue |
+| `reload_sources` | none | Reload source inventory and invalidate caches |
+
+## Secret masking
+
+Configuration-bearing responses include:
+
+```json
+{
+  "redaction": {
+    "enabled": true,
+    "replacement_count": 2
   }
 }
 ```
 
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Backup triggered for node 'router-core-01'",
-  "node": "router-core-01"
-}
-```
+Diffs are computed from raw configurations, then their changed lines are
+masked. Consequently, a secret-only change remains visible as a deletion and
+addition containing `<redacted>`.
 
-### Error Cases
-
-- **NodeNotFound**: If the node doesn't exist, suggestions for similar nodes are provided
-- **ApiUnreachable**: If Oxidized server is not accessible
-
-### Cache Behavior
-
-This operation invalidates the cache for the specified node. Subsequent resource reads will fetch fresh data.
-
----
-
-## prioritize_node
-
-Moves a node to the front of the Oxidized backup queue. The node will be processed before other pending nodes.
-
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `node` | string | Yes | The node name to prioritize |
-
-### Example
-
-**Request:**
-```json
-{
-  "name": "prioritize_node",
-  "arguments": {
-    "node": "switch-access-02"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Node 'switch-access-02' moved to front of backup queue",
-  "node": "switch-access-02"
-}
-```
-
-### Cache Behavior
-
-This operation invalidates the cache for the specified node.
-
----
-
-## reload_sources
-
-Reloads the Oxidized source inventory. New devices added to your inventory will become available immediately after this operation.
-
-### Parameters
-
-None.
-
-### Example
-
-**Request:**
-```json
-{
-  "name": "reload_sources",
-  "arguments": {}
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Oxidized source inventory reloaded"
-}
-```
-
-### Cache Behavior
-
-This operation invalidates the **entire** node cache. All subsequent resource reads will fetch fresh data.
-
----
-
-## diff_configs
-
-Compares two configuration versions of a node using the Myers/LCS diff algorithm (same as git). Returns a structured diff with additions, deletions, and context.
-
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `node` | string | Yes | The node name |
-| `version1` | string | Yes | First version OID (older) |
-| `version2` | string | Yes | Second version OID (newer) |
-
-### Example
-
-**Request:**
-```json
-{
-  "name": "diff_configs",
-  "arguments": {
-    "node": "router-core-01",
-    "version1": "abc123def456",
-    "version2": "789ghi012jkl"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "node": "router-core-01",
-  "version1": "abc123def456",
-  "version2": "789ghi012jkl",
-  "summary": {
-    "lines_added": 5,
-    "lines_deleted": 2,
-    "modification_blocks": 3
-  },
-  "unified_diff": "@@ -10,5 +10,8 @@\n context line\n-removed line\n+added line\n context line",
-  "additions": [
-    "ip route 10.0.0.0/8 192.168.1.1",
-    "snmp-server community newcommunity RO"
-  ],
-  "deletions": [
-    "ip route 172.16.0.0/12 192.168.1.1"
-  ]
-}
-```
-
-### Getting Version OIDs
-
-Use the `oxidized://node/{name}/versions` resource to get available version OIDs:
-
-```
-Read resource: oxidized://node/router-core-01/versions
-```
-
-### LLM-Friendly Output
-
-The response includes both structured data and a unified diff format that LLMs can easily interpret.
-
----
-
-## search_configs
-
-Searches for regex patterns across all (or specified) device configurations. Useful for security audits, compliance checks, and finding configuration patterns.
-
-### Parameters
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `pattern` | string | Yes | - | Regex pattern to search for |
-| `nodes` | array | No | all | List of node names to search |
-| `case_sensitive` | boolean | No | true | Case-sensitive search |
-| `limit` | integer | No | 100 | Max matches to return (1-1000) |
-
-### Examples
-
-**Search all devices for SNMP community:**
-```json
-{
-  "name": "search_configs",
-  "arguments": {
-    "pattern": "snmp-server community",
-    "case_sensitive": false
-  }
-}
-```
-
-**Search specific devices for IP addresses:**
-```json
-{
-  "name": "search_configs",
-  "arguments": {
-    "pattern": "ip address 10\\.0\\.",
-    "nodes": ["router-core-01", "router-core-02"]
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "pattern": "snmp-server community",
-  "nodes_searched": 15,
-  "nodes_matched": 8,
-  "total_matches": 24,
-  "shown_matches": 24,
-  "matches": [
-    {
-      "node": "router-core-01",
-      "matches": [
-        {
-          "line_number": 42,
-          "content": "snmp-server community public RO",
-          "context_before": ["!", "interface GigabitEthernet0/0"],
-          "context_after": ["snmp-server community private RW"]
-        }
-      ]
-    }
-  ]
-}
-```
-
-### Pattern Syntax
-
-Uses Rust regex syntax. Common patterns:
-
-| Pattern | Matches |
-|---------|---------|
-| `snmp-server` | Literal text |
-| `10\.0\.0\.\d+` | IP addresses in 10.0.0.x range |
-| `(?i)password` | Case-insensitive "password" |
-| `interface (Gi\|Te)` | Gigabit or TenGig interfaces |
-
-### Performance
-
-- Uses Oxidized's `conf_search` API for server-side pre-filtering when available
-- Parallel configuration fetching with rate limiting
-- Stop searching when limit is reached
-
-### Security Considerations
-
-- Pattern complexity is limited to prevent ReDoS attacks
-- Large result sets are truncated at the specified limit
+Set `OXIDIZED_REDACT_SECRETS=false` only on an administratively controlled
+server that requires raw output. There is deliberately no per-tool bypass.

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-28
+
+### Security
+
+- Mask common Cisco and Junos configuration secrets by default across current
+  and historical configurations, summaries, truncation, searches, diffs, and
+  resources.
+- Add `OXIDIZED_REDACT_SECRETS=false` as an administrator-only, server-wide raw
+  output switch with a startup warning.
+- Compute searches and diffs from raw text before masking their returned lines,
+  preserving evidence of secret-only changes without exposing values.
+
+### Added
+
+- Add resource-equivalent read tools: `list_nodes`, `get_node`,
+  `get_node_config`, `list_config_versions`, `get_config_version`, and
+  `diff_latest`.
+- Add structured MCP output schemas, `structuredContent`, and correct read/write
+  annotations for every tool.
+- Add tracked backup operations, `get_backup_status`, optional waiting, batch
+  backup requests, baseline/latest run metadata, and `mtime_changed`.
+- Add deterministic search pagination, literal matching, configurable context,
+  adjacent-match merging, per-node limits, model/backup/cache metadata, and
+  distinct scope/fetch/match/return counters.
+- Add explicit `fresh` cache metadata to resource and tool responses.
+
+### Changed
+
+- Treat an available Oxidized configuration prefilter with no candidates as a
+  real zero-match result; fall back only when the endpoint is unavailable.
+- Pending backup nodes bypass the configuration cache, and newer completed
+  runs count as complete even when configuration content is unchanged.
+- Preserve all existing `oxidized://` resources and legacy tool names.
+
+### Breaking
+
+- Configuration-bearing output is masked by default. This intentional output
+  compatibility change is the reason for the v2 major release.
+
 ## [1.2.0] - 2026-01-05
 
 ### Changed
@@ -102,7 +141,8 @@ mcp-oxidized is an MCP server that exposes Oxidized network configuration backup
 - docs/configuration.md - All environment variables and MCP client configs
 - docs/troubleshooting.md - Common errors and solutions
 
-[Unreleased]: https://github.com/fxthiry/mcp-oxidized/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/fxthiry/mcp-oxidized/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/fxthiry/mcp-oxidized/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/fxthiry/mcp-oxidized/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/fxthiry/mcp-oxidized/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/fxthiry/mcp-oxidized/compare/v1.0.0...v1.0.1

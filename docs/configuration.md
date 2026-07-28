@@ -12,6 +12,7 @@ This document describes all configuration options for mcp-oxidized.
 | `OXIDIZED_PASSWORD_FILE` | No | _(none)_ | Path to file containing password |
 | `OXIDIZED_SSL_VERIFY` | No | `true` | SSL certificate verification |
 | `OXIDIZED_HEADERS` | No | _(none)_ | Custom HTTP headers |
+| `OXIDIZED_REDACT_SECRETS` | No | `true` | Mask secrets in configuration-bearing output |
 
 ### OXIDIZED_URL
 
@@ -97,6 +98,27 @@ WARN mcp_oxidized: Custom Authorization header overrides OXIDIZED_USER/PASSWORD
 - Malformed headers are skipped with a warning
 - Empty values are allowed (`X-Empty:`)
 - Values can contain colons (`Authorization:Bearer token:with:colons`)
+
+### OXIDIZED_REDACT_SECRETS
+
+Controls centralized masking of secret-bearing configuration lines.
+
+```bash
+# Default and recommended
+export OXIDIZED_REDACT_SECRETS=true
+
+# Administrative raw-output mode; a startup warning is emitted
+export OXIDIZED_REDACT_SECRETS=false
+```
+
+Masking applies to current and historical configurations, summaries,
+truncation, searches, diffs, and resource responses. Search evaluates raw text
+before masking. Diffs are calculated from raw versions and mask their changed
+lines afterward. Raw output can only be enabled server-wide; callers cannot
+disable masking for an individual request.
+
+This default is new in v2.0.0 and intentionally changes the configuration
+content returned by clients upgrading from v1.
 
 ---
 

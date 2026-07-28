@@ -5,5 +5,6 @@
 pub mod config;
 pub mod error;
 pub mod oxidized;
+pub mod redaction;
 pub mod resources;
 pub mod tools;

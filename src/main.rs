@@ -1,92 +1,379 @@
 use mcp_oxidized::config::Config;
 use mcp_oxidized::error::{Actionable, OxidizedError};
 use mcp_oxidized::oxidized::OxidizedClient;
-use mcp_oxidized::resources;
-use mcp_oxidized::tools;
+use mcp_oxidized::{resources, tools};
 use rmcp::model::{
     Annotated, CallToolRequestParam, CallToolResult, Content, ErrorCode, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParam,
     ProtocolVersion, RawResource, RawResourceTemplate, ReadResourceRequestParam,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
 use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Decode a percent-encoded URI path segment to a node name.
-///
-/// Handles URL-encoded characters like `%20` (space), `%2F` (/), etc.
-/// Returns the decoded string, or the original if decoding fails.
-///
-/// # Examples
-///
-/// ```ignore
-/// assert_eq!(decode_node_name("router%201"), "router 1");
-/// assert_eq!(decode_node_name("switch-core"), "switch-core");
-/// ```
-fn decode_node_name(encoded: &str) -> Cow<'_, str> {
-    urlencoding::decode(encoded).unwrap_or(Cow::Borrowed(encoded))
-}
-
-/// MCP server implementation for Oxidized network device backup system.
-///
-/// Provides resources for node discovery, configuration access, and statistics:
-/// - `oxidized://nodes` - List all nodes (paginated)
-/// - `oxidized://node/{name}` - Get specific node details
-/// - `oxidized://node/{name}/config` - Get current configuration (FR5)
-/// - `oxidized://node/{name}/versions` - Get version history (FR6)
-/// - `oxidized://node/{name}/versions/{oid}` - Get specific version config (FR7)
-/// - `oxidized://stats` - Global statistics
-///
-/// Provides tools for backup, queue management, and configuration analysis:
-/// - `fetch_node_config` - Trigger immediate backup (FR15)
-/// - `prioritize_node` - Prioritize node in queue (FR16)
-/// - `reload_sources` - Reload source inventory (FR17)
-/// - `diff_configs` - Compare two configuration versions (FR9)
-/// - `search_configs` - Search for patterns across configurations (FR10-FR13)
 #[derive(Clone)]
 struct OxidizedServer {
     client: Arc<OxidizedClient>,
+    backups: tools::BackupRegistry,
 }
 
 impl OxidizedServer {
-    /// Create a new OxidizedServer with the given configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns `OxidizedError` if the HTTP client cannot be initialized.
     fn try_new(config: Config) -> Result<Self, OxidizedError> {
         Ok(Self {
             client: Arc::new(OxidizedClient::try_new(&config)?),
+            backups: tools::BackupRegistry::default(),
         })
     }
 
-    /// Convert OxidizedError to MCP ErrorData with LLM-optimized message.
-    fn to_mcp_error(err: OxidizedError) -> McpError {
-        let code = match &err {
-            OxidizedError::NodeNotFound(_, _) => ErrorCode::INVALID_PARAMS,
-            OxidizedError::AuthFailed => ErrorCode::INVALID_REQUEST,
-            OxidizedError::ApiUnreachable { .. } => ErrorCode::INTERNAL_ERROR,
-            OxidizedError::InvalidRegex(_) => ErrorCode::INVALID_PARAMS,
-            OxidizedError::ConfigError(_) => ErrorCode::INVALID_REQUEST,
+    fn to_mcp_error(error: OxidizedError) -> McpError {
+        let code = match error {
+            OxidizedError::NodeNotFound(_, _) | OxidizedError::InvalidRegex(_) => {
+                ErrorCode::INVALID_PARAMS
+            }
+            OxidizedError::AuthFailed | OxidizedError::ConfigError(_) => ErrorCode::INVALID_REQUEST,
             OxidizedError::ParseError { .. } => ErrorCode::PARSE_ERROR,
-            OxidizedError::HttpError { status_code, .. } => {
-                if *status_code >= 500 {
-                    ErrorCode::INTERNAL_ERROR
-                } else {
-                    ErrorCode::INVALID_REQUEST
-                }
+            OxidizedError::ApiUnreachable { .. } | OxidizedError::HttpError { .. } => {
+                ErrorCode::INTERNAL_ERROR
             }
         };
-
-        McpError::new(code, err.to_llm_message(), None)
+        McpError::new(code, error.to_llm_message(), None)
     }
+}
+
+fn object(value: Value) -> Arc<Map<String, Value>> {
+    Arc::new(value.as_object().cloned().unwrap_or_default())
+}
+
+fn annotations(read_only: bool) -> ToolAnnotations {
+    ToolAnnotations {
+        title: None,
+        read_only_hint: Some(read_only),
+        destructive_hint: Some(false),
+        idempotent_hint: Some(read_only),
+        open_world_hint: Some(false),
+    }
+}
+
+fn tool(
+    name: &'static str,
+    title: &str,
+    description: &'static str,
+    input_schema: Value,
+    read_only: bool,
+) -> Tool {
+    Tool {
+        name: Cow::Borrowed(name),
+        title: Some(title.to_string()),
+        description: Some(Cow::Borrowed(description)),
+        input_schema: object(input_schema),
+        output_schema: Some(object(output_schema(name))),
+        annotations: Some(annotations(read_only)),
+        icons: None,
+        meta: None,
+    }
+}
+
+fn output_schema(name: &str) -> Value {
+    let cache = json!({
+        "type": "object",
+        "properties": {
+            "cache_hit": {"type": "boolean"},
+            "fresh": {"type": "boolean"}
+        },
+        "required": ["cache_hit", "fresh"]
+    });
+    let redaction = json!({
+        "type": "object",
+        "properties": {
+            "enabled": {"type": "boolean"},
+            "replacement_count": {"type": "integer", "minimum": 0}
+        },
+        "required": ["enabled", "replacement_count"]
+    });
+    let properties = match name {
+        "list_nodes" | "list_config_versions" => json!({
+            "items": {"type": "array"},
+            "total": {"type": "integer", "minimum": 0},
+            "offset": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1},
+            "has_more": {"type": "boolean"},
+            "metadata": cache
+        }),
+        "get_node" => json!({"node": {"type": "object"}, "metadata": cache}),
+        "get_node_config" => json!({
+            "node": {"type": "string"},
+            "model": {"type": "string"},
+            "backup_timestamp": {"type": ["string", "null"]},
+            "mode": {"type": "string", "enum": ["full", "summary", "lines"]},
+            "config": {"type": "string"},
+            "summary": {"type": "object"},
+            "size": {"type": "object"},
+            "metadata": cache,
+            "redaction": redaction
+        }),
+        "get_config_version" => json!({
+            "config": {"type": "string"},
+            "oid": {"type": "string"},
+            "size": {"type": "object"},
+            "metadata": cache,
+            "redaction": redaction
+        }),
+        "diff_latest" | "diff_configs" => json!({
+            "node": {"type": "string"},
+            "version1": {"type": "string"},
+            "version2": {"type": "string"},
+            "identical": {"type": "boolean"},
+            "summary": {"type": "object"},
+            "additions": {"type": "array"},
+            "deletions": {"type": "array"},
+            "modifications": {"type": "array"},
+            "unified_diff": {"type": "string"},
+            "redaction": redaction
+        }),
+        "search_configs" => json!({
+            "pattern": {"type": "string"},
+            "case_sensitive": {"type": "boolean"},
+            "literal": {"type": "boolean"},
+            "context_before": {"type": "integer"},
+            "context_after": {"type": "integer"},
+            "total_matches": {"type": "integer"},
+            "shown_matches": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "limit": {"type": "integer"},
+            "has_more": {"type": "boolean"},
+            "nodes_searched": {"type": "integer"},
+            "configs_fetched": {"type": "integer"},
+            "nodes_with_matches": {"type": "integer"},
+            "nodes_returned": {"type": "integer"},
+            "results": {"type": "array"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "redaction": redaction
+        }),
+        "fetch_node_config" | "get_backup_status" => json!({
+            "operation_id": {"type": "string"},
+            "node": {"type": "string"},
+            "completion_state": {"type": "string", "enum": ["pending", "succeeded", "failed", "timed_out"]},
+            "status": {"type": ["string", "null"]},
+            "baseline": {"type": "object"},
+            "latest": {"type": "object"},
+            "mtime_changed": {"type": "boolean"},
+            "completed": {"type": "boolean"},
+            "message": {"type": "string"}
+        }),
+        "fetch_node_configs" => json!({
+            "operations": {"type": "array"},
+            "requested": {"type": "integer"},
+            "completed": {"type": "integer"},
+            "failed": {"type": "integer"},
+            "pending": {"type": "integer"}
+        }),
+        "prioritize_node" | "reload_sources" => json!({
+            "success": {"type": "boolean"},
+            "message": {"type": "string"},
+            "node": {"type": "string"}
+        }),
+        _ => json!({}),
+    };
+    let optional_fields: &[&str] = match name {
+        "get_node_config" => &["config", "summary"],
+        _ => &[],
+    };
+    let required = properties
+        .as_object()
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| !optional_fields.contains(&key.as_str()))
+                .cloned()
+                .map(Value::String)
+                .collect()
+        })
+        .unwrap_or_else(Vec::new);
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn structured<T: Serialize>(value: &T, text: String) -> Result<CallToolResult, McpError> {
+    let structured_content = serde_json::to_value(value).map_err(|error| {
+        McpError::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!("Failed to serialize tool result: {error}"),
+            None,
+        )
+    })?;
+    Ok(CallToolResult {
+        content: vec![Content::text(text)],
+        structured_content: Some(structured_content),
+        is_error: Some(false),
+        meta: None,
+    })
+}
+
+fn json_text<T: Serialize>(value: &T) -> Result<String, McpError> {
+    serde_json::to_string_pretty(value).map_err(|error| {
+        McpError::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!("Failed to serialize response: {error}"),
+            None,
+        )
+    })
+}
+
+fn resource<T: Serialize>(uri: String, value: &T) -> Result<ReadResourceResult, McpError> {
+    Ok(ReadResourceResult {
+        contents: vec![ResourceContents::TextResourceContents {
+            uri,
+            mime_type: Some("application/json".to_string()),
+            text: json_text(value)?,
+            meta: None,
+        }],
+    })
+}
+
+fn required_string<'a>(
+    arguments: &'a Option<Map<String, Value>>,
+    name: &str,
+) -> Result<&'a str, McpError> {
+    arguments
+        .as_ref()
+        .and_then(|args| args.get(name))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            McpError::new(
+                ErrorCode::INVALID_PARAMS,
+                format!("Missing required string parameter '{name}'"),
+                None,
+            )
+        })
+}
+
+fn optional_usize(arguments: &Option<Map<String, Value>>, name: &str) -> Option<usize> {
+    arguments
+        .as_ref()
+        .and_then(|args| args.get(name))
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+}
+
+fn optional_bool(arguments: &Option<Map<String, Value>>, name: &str, default: bool) -> bool {
+    arguments
+        .as_ref()
+        .and_then(|args| args.get(name))
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+fn optional_strings(arguments: &Option<Map<String, Value>>, name: &str) -> Option<Vec<String>> {
+    arguments
+        .as_ref()
+        .and_then(|args| args.get(name))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+}
+
+fn validate_tool_arguments(
+    tool_name: &str,
+    arguments: &Option<Map<String, Value>>,
+) -> Result<(), McpError> {
+    let Some(arguments) = arguments.as_ref() else {
+        return Ok(());
+    };
+    let invalid = |message: String| McpError::new(ErrorCode::INVALID_PARAMS, message, None);
+    let integer = |name: &str, minimum: u64, maximum: u64| -> Result<(), McpError> {
+        if let Some(value) = arguments.get(name) {
+            let value = value.as_u64().ok_or_else(|| {
+                invalid(format!("Parameter '{name}' must be a non-negative integer"))
+            })?;
+            if !(minimum..=maximum).contains(&value) {
+                return Err(invalid(format!(
+                    "Parameter '{name}' must be between {minimum} and {maximum}"
+                )));
+            }
+        }
+        Ok(())
+    };
+    let boolean = |name: &str| -> Result<(), McpError> {
+        if arguments.get(name).is_some_and(|value| !value.is_boolean()) {
+            return Err(invalid(format!("Parameter '{name}' must be a boolean")));
+        }
+        Ok(())
+    };
+
+    for name in [
+        "node",
+        "oid",
+        "pattern",
+        "group",
+        "name_pattern",
+        "model",
+        "status",
+        "version1",
+        "version2",
+        "operation_id",
+        "mode",
+    ] {
+        if arguments.get(name).is_some_and(|value| !value.is_string()) {
+            return Err(invalid(format!("Parameter '{name}' must be a string")));
+        }
+    }
+    for name in ["wait", "force_refresh", "case_sensitive", "literal"] {
+        boolean(name)?;
+    }
+    integer("offset", 0, usize::MAX as u64)?;
+    integer("start_line", 1, usize::MAX as u64)?;
+    integer("end_line", 1, usize::MAX as u64)?;
+    integer("truncate_head", 0, usize::MAX as u64)?;
+    integer("truncate_tail", 0, usize::MAX as u64)?;
+    integer("timeout_seconds", 1, 300)?;
+    integer("concurrency", 1, 10)?;
+    integer("context_before", 0, tools::MAX_CONTEXT_LINES as u64)?;
+    integer("context_after", 0, tools::MAX_CONTEXT_LINES as u64)?;
+    integer("limit_per_node", 1, 1000)?;
+    integer(
+        "limit",
+        1,
+        if tool_name == "search_configs" {
+            1000
+        } else {
+            resources::MAX_PAGE_SIZE as u64
+        },
+    )?;
+
+    if let Some(nodes) = arguments.get("nodes") {
+        let nodes = nodes
+            .as_array()
+            .ok_or_else(|| invalid("Parameter 'nodes' must be an array of strings".to_string()))?;
+        if nodes.iter().any(|node| !node.is_string()) {
+            return Err(invalid(
+                "Parameter 'nodes' must contain only strings".to_string(),
+            ));
+        }
+        if tool_name == "fetch_node_configs" && !(1..=20).contains(&nodes.len()) {
+            return Err(invalid(
+                "Parameter 'nodes' must contain between 1 and 20 nodes".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ServerHandler for OxidizedServer {
@@ -105,31 +392,27 @@ impl ServerHandler for OxidizedServer {
                 website_url: None,
             },
             instructions: Some(
-                "MCP server for Oxidized network device configuration backup system. \
-                 Use oxidized://nodes to list devices, oxidized://node/{name} for details, \
-                 and oxidized://stats for backup statistics."
+                "Use list_nodes and get_node for discovery, get_node_config for masked \
+                 configuration output, search_configs for deterministic cross-node search, \
+                 and fetch_node_config/get_backup_status for tracked backups."
                     .to_string(),
             ),
         }
     }
 
-    #[instrument(skip(self, _context), fields(request_id = %resources::generate_request_id()))]
-    fn list_resources(
+    async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        async move {
-            let resources = vec![
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult {
+            resources: vec![
                 Annotated::new(
                     RawResource {
                         uri: "oxidized://nodes".to_string(),
                         name: "nodes".to_string(),
                         title: Some("All Nodes".to_string()),
-                        description: Some(
-                            "List all network devices in the Oxidized inventory with pagination"
-                                .to_string(),
-                        ),
+                        description: Some("Paginated Oxidized inventory".to_string()),
                         mime_type: Some("application/json".to_string()),
                         size: None,
                         icons: None,
@@ -142,10 +425,7 @@ impl ServerHandler for OxidizedServer {
                         uri: "oxidized://stats".to_string(),
                         name: "stats".to_string(),
                         title: Some("Statistics".to_string()),
-                        description: Some(
-                            "Global backup statistics including success rate and last run time"
-                                .to_string(),
-                        ),
+                        description: Some("Oxidized backup statistics".to_string()),
                         mime_type: Some("application/json".to_string()),
                         size: None,
                         icons: None,
@@ -153,725 +433,522 @@ impl ServerHandler for OxidizedServer {
                     },
                     None,
                 ),
-            ];
-
-            Ok(ListResourcesResult {
-                resources,
-                next_cursor: None,
-                meta: None,
-            })
-        }
+            ],
+            next_cursor: None,
+            meta: None,
+        })
     }
 
-    #[instrument(skip(self, _context), fields(request_id = %resources::generate_request_id()))]
-    fn list_resource_templates(
+    async fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
-        async move {
-            let templates = vec![
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "oxidized://node/{name}".to_string(),
-                        name: "node".to_string(),
-                        title: Some("Node Details".to_string()),
-                        description: Some(
-                            "Get detailed information about a specific network device by name"
-                                .to_string(),
-                        ),
-                        mime_type: Some("application/json".to_string()),
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "oxidized://node/{name}/config".to_string(),
-                        name: "node_config".to_string(),
-                        title: Some("Node Configuration".to_string()),
-                        description: Some(
-                            "Get the current configuration of a network device with size metadata. \
-                             Supports query parameters: truncate=true (preserve head+tail lines), \
-                             truncate_head=N (lines at start, default 500), truncate_tail=N (lines at end, default 100), \
-                             summary=true (return section summary instead of full config). \
-                             Example: oxidized://node/router1/config?truncate=true&truncate_head=100"
-                                .to_string(),
-                        ),
-                        mime_type: Some("application/json".to_string()),
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "oxidized://node/{name}/versions".to_string(),
-                        name: "node_versions".to_string(),
-                        title: Some("Configuration Versions".to_string()),
-                        description: Some(
-                            "List all available configuration versions for a node, sorted newest first"
-                                .to_string(),
-                        ),
-                        mime_type: Some("application/json".to_string()),
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "oxidized://node/{name}/versions/{oid}".to_string(),
-                        name: "node_version".to_string(),
-                        title: Some("Historical Configuration".to_string()),
-                        description: Some(
-                            "Get configuration at a specific version by Git commit OID"
-                                .to_string(),
-                        ),
-                        mime_type: Some("application/json".to_string()),
-                    },
-                    None,
-                ),
-            ];
-
-            Ok(ListResourceTemplatesResult {
-                resource_templates: templates,
-                next_cursor: None,
-                meta: None,
-            })
-        }
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let definitions = [
+            (
+                "oxidized://node/{name}",
+                "node",
+                "Node Details",
+                "Node metadata and freshness information",
+            ),
+            (
+                "oxidized://node/{name}/config",
+                "node_config",
+                "Node Configuration",
+                "Latest configuration, masked by default",
+            ),
+            (
+                "oxidized://node/{name}/versions",
+                "node_versions",
+                "Configuration Versions",
+                "Historical configuration versions",
+            ),
+            (
+                "oxidized://node/{name}/versions/{oid}",
+                "node_version",
+                "Historical Configuration",
+                "Masked configuration for a specific version",
+            ),
+        ];
+        Ok(ListResourceTemplatesResult {
+            resource_templates: definitions
+                .into_iter()
+                .map(|(uri, name, title, description)| {
+                    Annotated::new(
+                        RawResourceTemplate {
+                            uri_template: uri.to_string(),
+                            name: name.to_string(),
+                            title: Some(title.to_string()),
+                            description: Some(description.to_string()),
+                            mime_type: Some("application/json".to_string()),
+                        },
+                        None,
+                    )
+                })
+                .collect(),
+            next_cursor: None,
+            meta: None,
+        })
     }
 
-    #[instrument(skip(self, _context), fields(request_id = %resources::generate_request_id(), uri = %request.uri))]
     fn read_resource(
         &self,
         request: ReadResourceRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         let client = Arc::clone(&self.client);
-
         async move {
-            let uri = &request.uri;
-
-            // Parse the URI and route to appropriate handler
+            let uri = request.uri;
             if uri == "oxidized://nodes" {
-                // List all nodes
-                let result = resources::list_nodes(&*client, None, None, None)
+                let value = resources::list_nodes(&*client, None, None, None)
                     .await
                     .map_err(Self::to_mcp_error)?;
-
-                let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                    McpError::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to serialize nodes: {}", e),
-                        None,
-                    )
-                })?;
-
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::TextResourceContents {
-                        uri: uri.clone(),
-                        mime_type: Some("application/json".to_string()),
-                        text: json,
-                        meta: None,
-                    }],
-                })
-            } else if uri == "oxidized://stats" {
-                // Get statistics
-                let result = resources::get_stats(&*client)
-                    .await
-                    .map_err(Self::to_mcp_error)?;
-
-                let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                    McpError::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to serialize stats: {}", e),
-                        None,
-                    )
-                })?;
-
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::TextResourceContents {
-                        uri: uri.clone(),
-                        mime_type: Some("application/json".to_string()),
-                        text: json,
-                        meta: None,
-                    }],
-                })
-            } else if let Some(path) = uri.strip_prefix("oxidized://node/") {
-                // Parse node resource paths:
-                // - {name} -> node details
-                // - {name}/config -> node configuration
-                // - {name}/versions -> version list
-                // - {name}/versions/{oid} -> specific version
-
-                if path.contains("/config") {
-                    // oxidized://node/{name}/config?truncate=true&summary=false
-                    // Parse path and query params
-                    let (node_part, query_string) = if let Some(idx) = path.find('?') {
-                        (&path[..idx], Some(&path[idx + 1..]))
-                    } else {
-                        (path, None)
-                    };
-
-                    // Extract node name (remove /config suffix) and decode percent-encoding
-                    let node_name_encoded = node_part.strip_suffix("/config").ok_or_else(|| {
-                        McpError::new(
-                            ErrorCode::INVALID_PARAMS,
-                            "[Error] Invalid config path.\n\
-                             [Context] Expected format: oxidized://node/{name}/config\n\
-                             [Next Step] Provide a valid node name.",
-                            None,
-                        )
-                    })?;
-                    let node_name = decode_node_name(node_name_encoded);
-
-                    // Parse query parameters
-                    let mut truncate = false;
-                    let mut truncate_head: Option<usize> = None;
-                    let mut truncate_tail: Option<usize> = None;
-                    let mut summary = false;
-
-                    if let Some(qs) = query_string {
-                        for param in qs.split('&') {
-                            if let Some((key, value)) = param.split_once('=') {
-                                match key {
-                                    "truncate" => truncate = value == "true",
-                                    "truncate_head" => truncate_head = value.parse().ok(),
-                                    "truncate_tail" => truncate_tail = value.parse().ok(),
-                                    "summary" => summary = value == "true",
-                                    _ => {} // Ignore unknown params
-                                }
-                            }
-                        }
-                    }
-
-                    // Build truncation params if truncate=true
-                    let truncation = if truncate {
-                        Some(resources::TruncationParams::new(
-                            true,
-                            truncate_head,
-                            truncate_tail,
-                        ))
-                    } else {
-                        None
-                    };
-
-                    let result = resources::get_node_config_with_options(
-                        &*client, &node_name, truncation, summary,
-                    )
-                    .await
-                    .map_err(Self::to_mcp_error)?;
-
-                    let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                        McpError::new(
-                            ErrorCode::INTERNAL_ERROR,
-                            format!("Failed to serialize config: {}", e),
-                            None,
-                        )
-                    })?;
-
-                    Ok(ReadResourceResult {
-                        contents: vec![ResourceContents::TextResourceContents {
-                            uri: uri.clone(),
-                            mime_type: Some("application/json".to_string()),
-                            text: json,
-                            meta: None,
-                        }],
-                    })
-                } else if path.contains("/versions/") {
-                    // oxidized://node/{name}/versions/{oid} - Get specific version
-                    let parts: Vec<&str> = path.splitn(3, '/').collect();
-                    if parts.len() == 3 && parts[1] == "versions" {
-                        let node_name = decode_node_name(parts[0]);
-                        let oid = parts[2];
-                        let result = resources::get_node_version(&*client, &node_name, oid)
-                            .await
-                            .map_err(Self::to_mcp_error)?;
-
-                        let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                            McpError::new(
-                                ErrorCode::INTERNAL_ERROR,
-                                format!("Failed to serialize version config: {}", e),
-                                None,
-                            )
-                        })?;
-
-                        Ok(ReadResourceResult {
-                            contents: vec![ResourceContents::TextResourceContents {
-                                uri: uri.clone(),
-                                mime_type: Some("application/json".to_string()),
-                                text: json,
-                                meta: None,
-                            }],
-                        })
-                    } else {
-                        Err(McpError::new(
-                            ErrorCode::INVALID_PARAMS,
-                            format!(
-                                "[Error] Invalid version path: '{}'\n\
-                                 [Context] Expected format: oxidized://node/{{name}}/versions/{{oid}}\n\
-                                 [Next Step] Provide both node name and version OID.",
-                                uri
-                            ),
-                            None,
-                        ))
-                    }
-                } else if let Some(node_name_encoded) = path.strip_suffix("/versions") {
-                    // oxidized://node/{name}/versions - Get version list
-                    let node_name = decode_node_name(node_name_encoded);
-                    let result = resources::get_node_versions(&*client, &node_name)
-                        .await
-                        .map_err(Self::to_mcp_error)?;
-
-                    let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                        McpError::new(
-                            ErrorCode::INTERNAL_ERROR,
-                            format!("Failed to serialize versions: {}", e),
-                            None,
-                        )
-                    })?;
-
-                    Ok(ReadResourceResult {
-                        contents: vec![ResourceContents::TextResourceContents {
-                            uri: uri.clone(),
-                            mime_type: Some("application/json".to_string()),
-                            text: json,
-                            meta: None,
-                        }],
-                    })
-                } else if !path.contains('/') {
-                    // oxidized://node/{name} - Get node details (no slashes in name)
-                    let node_name = decode_node_name(path);
-                    let result = resources::get_node(&*client, &node_name)
-                        .await
-                        .map_err(Self::to_mcp_error)?;
-
-                    let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                        McpError::new(
-                            ErrorCode::INTERNAL_ERROR,
-                            format!("Failed to serialize node: {}", e),
-                            None,
-                        )
-                    })?;
-
-                    Ok(ReadResourceResult {
-                        contents: vec![ResourceContents::TextResourceContents {
-                            uri: uri.clone(),
-                            mime_type: Some("application/json".to_string()),
-                            text: json,
-                            meta: None,
-                        }],
-                    })
-                } else {
-                    // Unknown subpath
-                    Err(McpError::new(
-                        ErrorCode::INVALID_PARAMS,
-                        format!(
-                            "[Error] Unknown node resource path: '{}'\n\
-                             [Context] Attempted to read an unsupported node subresource.\n\
-                             [Suggestions] Valid paths: /config, /versions, /versions/{{oid}}\n\
-                             [Next Step] Use oxidized://node/{{name}}/config, /versions, or /versions/{{oid}}.",
-                            uri
-                        ),
-                        None,
-                    ))
-                }
-            } else {
-                // Unknown resource URI
-                Err(McpError::new(
-                    ErrorCode::INVALID_PARAMS,
-                    format!(
-                        "[Error] Unknown resource URI: '{}'\n\
-                         [Context] Attempted to read a resource that does not exist.\n\
-                         [Suggestions] Available resources: oxidized://nodes, oxidized://stats, oxidized://node/{{name}}, oxidized://node/{{name}}/config, oxidized://node/{{name}}/versions\n\
-                         [Next Step] Use one of the available resource URIs.",
-                        uri
-                    ),
-                    None,
-                ))
+                return resource(uri, &value);
             }
+            if uri == "oxidized://stats" {
+                let value = resources::get_stats(&*client)
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                return resource(uri, &value);
+            }
+            let node_uri = uri.strip_prefix("oxidized://node/").ok_or_else(|| {
+                McpError::new(ErrorCode::INVALID_PARAMS, "Unknown resource URI", None)
+            })?;
+            let (path, query) = node_uri
+                .split_once('?')
+                .map_or((node_uri, None), |(path, query)| (path, Some(query)));
+            if let Some(node) = path.strip_suffix("/config") {
+                let node = urlencoding::decode(node).unwrap_or(Cow::Borrowed(node));
+                let mut truncate = false;
+                let mut truncate_head = None;
+                let mut truncate_tail = None;
+                let mut summary = false;
+                for (key, value) in query
+                    .into_iter()
+                    .flat_map(|query| query.split('&'))
+                    .filter_map(|pair| pair.split_once('='))
+                {
+                    match key {
+                        "truncate" => truncate = value == "true",
+                        "truncate_head" => truncate_head = value.parse().ok(),
+                        "truncate_tail" => truncate_tail = value.parse().ok(),
+                        "summary" => summary = value == "true",
+                        _ => {}
+                    }
+                }
+                let truncation = truncate
+                    .then(|| resources::TruncationParams::new(true, truncate_head, truncate_tail));
+                let value =
+                    resources::get_node_config_with_options(&*client, &node, truncation, summary)
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                return resource(uri, &value);
+            }
+            if let Some(node) = path.strip_suffix("/versions") {
+                let node = urlencoding::decode(node).unwrap_or(Cow::Borrowed(node));
+                let value = resources::get_node_versions(&*client, &node)
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                return resource(uri, &value);
+            }
+            if let Some((node, oid)) = path.split_once("/versions/") {
+                let node = urlencoding::decode(node).unwrap_or(Cow::Borrowed(node));
+                let value = resources::get_node_version(&*client, &node, oid)
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                return resource(uri, &value);
+            }
+            let node = urlencoding::decode(path).unwrap_or(Cow::Borrowed(path));
+            let value = resources::get_node(&*client, &node)
+                .await
+                .map_err(Self::to_mcp_error)?;
+            resource(uri, &value)
         }
     }
 
-    #[instrument(skip(self, _context), fields(request_id = %resources::generate_request_id()))]
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        async move {
-            // Helper to convert serde_json::Value to JsonObject (Map<String, Value>)
-            fn value_to_json_object(
-                v: serde_json::Value,
-            ) -> std::sync::Arc<serde_json::Map<String, serde_json::Value>> {
-                match v {
-                    serde_json::Value::Object(map) => std::sync::Arc::new(map),
-                    _ => std::sync::Arc::new(serde_json::Map::new()),
-                }
-            }
-
-            let tools = vec![
-                Tool {
-                    name: Cow::Borrowed("fetch_node_config"),
-                    title: Some("Fetch Node Configuration".to_string()),
-                    description: Some(Cow::Borrowed(
-                        "Trigger an immediate backup of a node's configuration. \
-                         The fresh configuration will be available shortly after.",
-                    )),
-                    input_schema: value_to_json_object(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "node": {
-                                "type": "string",
-                                "description": "The node name to backup"
-                            }
-                        },
-                        "required": ["node"]
-                    })),
-                    output_schema: None,
-                    annotations: None,
-                    icons: None,
-                    meta: None,
-                },
-                Tool {
-                    name: Cow::Borrowed("prioritize_node"),
-                    title: Some("Prioritize Node".to_string()),
-                    description: Some(Cow::Borrowed(
-                        "Move a node to the front of the backup queue. \
-                         The node will be processed before other pending nodes.",
-                    )),
-                    input_schema: value_to_json_object(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "node": {
-                                "type": "string",
-                                "description": "The node name to prioritize"
-                            }
-                        },
-                        "required": ["node"]
-                    })),
-                    output_schema: None,
-                    annotations: None,
-                    icons: None,
-                    meta: None,
-                },
-                Tool {
-                    name: Cow::Borrowed("reload_sources"),
-                    title: Some("Reload Sources".to_string()),
-                    description: Some(Cow::Borrowed(
-                        "Reload the Oxidized source inventory. \
-                         New devices will be immediately available after this operation.",
-                    )),
-                    input_schema: value_to_json_object(serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    })),
-                    output_schema: None,
-                    annotations: None,
-                    icons: None,
-                    meta: None,
-                },
-                Tool {
-                    name: Cow::Borrowed("diff_configs"),
-                    title: Some("Diff Configurations".to_string()),
-                    description: Some(Cow::Borrowed(
-                        "Compare two configuration versions of a node. \
-                         Returns a structured diff with additions, deletions, and modifications \
-                         in an LLM-friendly format.",
-                    )),
-                    input_schema: value_to_json_object(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "node": {
-                                "type": "string",
-                                "description": "The node name to compare configurations for"
-                            },
-                            "version1": {
-                                "type": "string",
-                                "description": "The first version OID (older version)"
-                            },
-                            "version2": {
-                                "type": "string",
-                                "description": "The second version OID (newer version)"
-                            }
-                        },
-                        "required": ["node", "version1", "version2"]
-                    })),
-                    output_schema: None,
-                    annotations: None,
-                    icons: None,
-                    meta: None,
-                },
-                Tool {
-                    name: Cow::Borrowed("search_configs"),
-                    title: Some("Search Configurations".to_string()),
-                    description: Some(Cow::Borrowed(
-                        "Search for regex patterns across network device configurations. \
-                         Returns matches with line numbers and context lines. \
-                         Supports case-sensitive/insensitive search and optional node filtering.",
-                    )),
-                    input_schema: value_to_json_object(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "string",
-                                "description": "Regex pattern to search for (e.g., 'ip address 10\\.0\\.' or 'snmp-server community')"
-                            },
-                            "nodes": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional list of node names to limit search to. If not provided, searches all nodes."
-                            },
-                            "case_sensitive": {
-                                "type": "boolean",
-                                "default": true,
-                                "description": "Whether the search is case-sensitive (default: true)"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "default": 100,
-                                "minimum": 1,
-                                "maximum": 1000,
-                                "description": "Maximum number of matches to return (default: 100)"
-                            }
-                        },
-                        "required": ["pattern"]
-                    })),
-                    output_schema: None,
-                    annotations: None,
-                    icons: None,
-                    meta: None,
-                },
-            ];
-
-            Ok(ListToolsResult {
-                tools,
-                next_cursor: None,
-                meta: None,
-            })
-        }
+    ) -> Result<ListToolsResult, McpError> {
+        let node = json!({"type":"string","minLength":1});
+        let pagination = json!({
+            "offset":{"type":"integer","minimum":0,"default":0},
+            "limit":{"type":"integer","minimum":1,"maximum":500,"default":100}
+        });
+        let tools = vec![
+            tool(
+                "list_nodes",
+                "List Nodes",
+                "List and filter Oxidized nodes.",
+                json!({
+                    "type":"object","properties":{
+                        "offset":pagination["offset"],"limit":pagination["limit"],
+                        "group":{"type":"string"},"name_pattern":{"type":"string"},
+                        "model":{"type":"string"},"status":{"type":"string"}
+                    }
+                }),
+                true,
+            ),
+            tool(
+                "get_node",
+                "Get Node",
+                "Get one Oxidized node.",
+                json!({
+                    "type":"object","properties":{"node":node},"required":["node"]
+                }),
+                true,
+            ),
+            tool(
+                "get_node_config",
+                "Get Node Configuration",
+                "Get a masked current configuration in full, summary, or line-range mode.",
+                json!({
+                    "type":"object","properties":{
+                        "node":node,"mode":{"type":"string","enum":["full","summary","lines"],"default":"full"},
+                        "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},
+                        "truncate_head":{"type":"integer","minimum":0},"truncate_tail":{"type":"integer","minimum":0},
+                        "force_refresh":{"type":"boolean","default":false}
+                    },"required":["node"]
+                }),
+                true,
+            ),
+            tool(
+                "list_config_versions",
+                "List Configuration Versions",
+                "List historical versions newest first.",
+                json!({
+                    "type":"object","properties":{"node":node,"offset":pagination["offset"],"limit":pagination["limit"]},"required":["node"]
+                }),
+                true,
+            ),
+            tool(
+                "get_config_version",
+                "Get Configuration Version",
+                "Get a masked historical configuration.",
+                json!({
+                    "type":"object","properties":{"node":node,"oid":{"type":"string","minLength":1}},"required":["node","oid"]
+                }),
+                true,
+            ),
+            tool(
+                "diff_latest",
+                "Diff Latest Configurations",
+                "Compare the newest two versions.",
+                json!({
+                    "type":"object","properties":{"node":node},"required":["node"]
+                }),
+                true,
+            ),
+            tool(
+                "diff_configs",
+                "Diff Configurations",
+                "Compare two version OIDs; changed secret lines remain visible but masked.",
+                json!({
+                    "type":"object","properties":{"node":node,"version1":{"type":"string"},"version2":{"type":"string"}},"required":["node","version1","version2"]
+                }),
+                true,
+            ),
+            tool(
+                "search_configs",
+                "Search Configurations",
+                "Search raw configs and return masked matches with deterministic pagination.",
+                json!({
+                    "type":"object","properties":{
+                        "pattern":{"type":"string","minLength":1},"nodes":{"type":"array","items":{"type":"string"}},
+                        "case_sensitive":{"type":"boolean","default":true},"literal":{"type":"boolean","default":false},
+                        "context_before":{"type":"integer","minimum":0,"maximum":50,"default":1},
+                        "context_after":{"type":"integer","minimum":0,"maximum":50,"default":1},
+                        "limit":{"type":"integer","minimum":1,"maximum":1000,"default":100},
+                        "limit_per_node":{"type":"integer","minimum":1,"maximum":1000},
+                        "offset":{"type":"integer","minimum":0,"default":0}
+                    },"required":["pattern"]
+                }),
+                true,
+            ),
+            tool(
+                "fetch_node_config",
+                "Fetch Node Configuration",
+                "Queue a tracked backup and optionally wait for completion.",
+                json!({
+                    "type":"object","properties":{"node":node,"wait":{"type":"boolean","default":false},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":60}},"required":["node"]
+                }),
+                false,
+            ),
+            tool(
+                "get_backup_status",
+                "Get Backup Status",
+                "Poll a tracked backup operation.",
+                json!({
+                    "type":"object","properties":{"operation_id":{"type":"string","minLength":1}},"required":["operation_id"]
+                }),
+                true,
+            ),
+            tool(
+                "fetch_node_configs",
+                "Fetch Node Configurations",
+                "Queue up to 20 tracked backups.",
+                json!({
+                    "type":"object","properties":{
+                        "nodes":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20},
+                        "wait":{"type":"boolean","default":false},
+                        "timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":60},
+                        "concurrency":{"type":"integer","minimum":1,"maximum":10,"default":5}
+                    },"required":["nodes"]
+                }),
+                false,
+            ),
+            tool(
+                "prioritize_node",
+                "Prioritize Node",
+                "Move a node to the front of the Oxidized queue.",
+                json!({
+                    "type":"object","properties":{"node":node},"required":["node"]
+                }),
+                false,
+            ),
+            tool(
+                "reload_sources",
+                "Reload Sources",
+                "Reload the Oxidized inventory.",
+                json!({
+                    "type":"object","properties":{}
+                }),
+                false,
+            ),
+        ];
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        })
     }
 
-    #[instrument(skip(self, _context), fields(request_id = %resources::generate_request_id(), tool = %request.name))]
     fn call_tool(
         &self,
         request: CallToolRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         let client = Arc::clone(&self.client);
-
+        let backups = self.backups.clone();
         async move {
-            let tool_name = request.name.as_ref();
-            let args = &request.arguments;
-
-            match tool_name {
-                "fetch_node_config" => {
-                    let node = args
-                        .as_ref()
-                        .and_then(|a| a.get("node"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(
-                                ErrorCode::INVALID_PARAMS,
-                                "[Error] Missing required parameter 'node'.\n\
-                                 [Context] Tool 'fetch_node_config' requires a node name.\n\
-                                 [Next Step] Provide a valid node name parameter.",
-                                None,
-                            )
-                        })?;
-
-                    let result = tools::fetch_node_config(&client, node)
+            let args = request.arguments;
+            validate_tool_arguments(request.name.as_ref(), &args)?;
+            match request.name.as_ref() {
+                "list_nodes" => {
+                    let filters = tools::NodeFilters {
+                        group: args
+                            .as_ref()
+                            .and_then(|a| a.get("group"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        name_pattern: args
+                            .as_ref()
+                            .and_then(|a| a.get("name_pattern"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        model: args
+                            .as_ref()
+                            .and_then(|a| a.get("model"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        status: args
+                            .as_ref()
+                            .and_then(|a| a.get("status"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    };
+                    let value = tools::list_nodes(
+                        &client,
+                        optional_usize(&args, "offset").unwrap_or(0),
+                        optional_usize(&args, "limit").unwrap_or(100),
+                        filters,
+                    )
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                    structured(
+                        &value,
+                        format!("Returned {} of {} nodes.", value.items.len(), value.total),
+                    )
+                }
+                "get_node" => {
+                    let value = tools::get_node(&client, required_string(&args, "node")?)
                         .await
                         .map_err(Self::to_mcp_error)?;
-
-                    let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                        McpError::new(
-                            ErrorCode::INTERNAL_ERROR,
-                            format!("Failed to serialize result: {}", e),
-                            None,
-                        )
-                    })?;
-
-                    Ok(CallToolResult {
-                        content: vec![Content::text(json)],
-                        structured_content: None,
-                        is_error: Some(false),
-                        meta: None,
-                    })
+                    structured(
+                        &value,
+                        format!("Node {} ({})", value.node.name, value.node.model),
+                    )
                 }
-                "prioritize_node" => {
-                    let node = args
+                "get_node_config" => {
+                    let node = required_string(&args, "node")?;
+                    let mode = args
                         .as_ref()
-                        .and_then(|a| a.get("node"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(
-                                ErrorCode::INVALID_PARAMS,
-                                "[Error] Missing required parameter 'node'.\n\
-                                 [Context] Tool 'prioritize_node' requires a node name.\n\
-                                 [Next Step] Provide a valid node name parameter.",
-                                None,
-                            )
-                        })?;
-
-                    let result = tools::prioritize_node(&client, node)
-                        .await
-                        .map_err(Self::to_mcp_error)?;
-
-                    let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                        McpError::new(
-                            ErrorCode::INTERNAL_ERROR,
-                            format!("Failed to serialize result: {}", e),
-                            None,
-                        )
-                    })?;
-
-                    Ok(CallToolResult {
-                        content: vec![Content::text(json)],
-                        structured_content: None,
-                        is_error: Some(false),
-                        meta: None,
-                    })
+                        .and_then(|a| a.get("mode"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("full");
+                    let value = tools::get_node_config(
+                        &client,
+                        node,
+                        tools::ConfigMode::parse(mode).map_err(Self::to_mcp_error)?,
+                        optional_usize(&args, "start_line"),
+                        optional_usize(&args, "end_line"),
+                        optional_usize(&args, "truncate_head"),
+                        optional_usize(&args, "truncate_tail"),
+                        optional_bool(&args, "force_refresh", false),
+                    )
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                    structured(
+                        &value,
+                        format!(
+                            "Configuration for {node} ({mode}, {} lines).",
+                            value.size.lines
+                        ),
+                    )
                 }
-                "reload_sources" => {
-                    // No parameters needed for this tool
-                    let result = tools::reload_sources(&client)
-                        .await
-                        .map_err(Self::to_mcp_error)?;
-
-                    let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                        McpError::new(
-                            ErrorCode::INTERNAL_ERROR,
-                            format!("Failed to serialize result: {}", e),
-                            None,
-                        )
-                    })?;
-
-                    Ok(CallToolResult {
-                        content: vec![Content::text(json)],
-                        structured_content: None,
-                        is_error: Some(false),
-                        meta: None,
-                    })
+                "list_config_versions" => {
+                    let node = required_string(&args, "node")?;
+                    let value = tools::list_config_versions(
+                        &client,
+                        node,
+                        optional_usize(&args, "offset").unwrap_or(0),
+                        optional_usize(&args, "limit").unwrap_or(100),
+                    )
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                    structured(
+                        &value,
+                        format!(
+                            "Returned {} of {} versions for {node}.",
+                            value.items.len(),
+                            value.total
+                        ),
+                    )
                 }
-                "diff_configs" => {
-                    let node = args
-                        .as_ref()
-                        .and_then(|a| a.get("node"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(
-                                ErrorCode::INVALID_PARAMS,
-                                "[Error] Missing required parameter 'node'.\n\
-                                 [Context] Tool 'diff_configs' requires a node name.\n\
-                                 [Next Step] Provide a valid node name parameter.",
-                                None,
-                            )
-                        })?;
-
-                    let version1 = args
-                        .as_ref()
-                        .and_then(|a| a.get("version1"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(
-                                ErrorCode::INVALID_PARAMS,
-                                "[Error] Missing required parameter 'version1'.\n\
-                                 [Context] Tool 'diff_configs' requires the first version OID.\n\
-                                 [Next Step] Provide a valid version1 OID parameter.",
-                                None,
-                            )
-                        })?;
-
-                    let version2 = args
-                        .as_ref()
-                        .and_then(|a| a.get("version2"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(
-                                ErrorCode::INVALID_PARAMS,
-                                "[Error] Missing required parameter 'version2'.\n\
-                                 [Context] Tool 'diff_configs' requires the second version OID.\n\
-                                 [Next Step] Provide a valid version2 OID parameter.",
-                                None,
-                            )
-                        })?;
-
-                    let result = tools::diff_configs(&client, node, version1, version2)
-                        .await
-                        .map_err(Self::to_mcp_error)?;
-
-                    // Return both the LLM-friendly format and the structured JSON
-                    let llm_output = result.to_llm_format();
-
-                    Ok(CallToolResult {
-                        content: vec![Content::text(llm_output)],
-                        structured_content: None,
-                        is_error: Some(false),
-                        meta: None,
-                    })
-                }
-                "search_configs" => {
-                    let pattern = args
-                        .as_ref()
-                        .and_then(|a| a.get("pattern"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(
-                                ErrorCode::INVALID_PARAMS,
-                                "[Error] Missing required parameter 'pattern'.\n\
-                                 [Context] Tool 'search_configs' requires a regex pattern.\n\
-                                 [Next Step] Provide a valid regex pattern parameter.",
-                                None,
-                            )
-                        })?;
-
-                    // Optional: nodes array
-                    let nodes: Option<Vec<String>> = args
-                        .as_ref()
-                        .and_then(|a| a.get("nodes"))
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        });
-
-                    // Optional: case_sensitive (default: true)
-                    let case_sensitive = args
-                        .as_ref()
-                        .and_then(|a| a.get("case_sensitive"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-
-                    // Optional: limit (default: 100, min: 1, max: 1000)
-                    let limit = args
-                        .as_ref()
-                        .and_then(|a| a.get("limit"))
-                        .and_then(|v| v.as_u64())
-                        .map(|l| l.clamp(1, 1000) as u32)
-                        .unwrap_or(100);
-
-                    let result =
-                        tools::search_configs(&client, pattern, nodes, case_sensitive, limit)
+                "get_config_version" => {
+                    let node = required_string(&args, "node")?;
+                    let value =
+                        tools::get_config_version(&client, node, required_string(&args, "oid")?)
                             .await
                             .map_err(Self::to_mcp_error)?;
-
-                    let llm_output = result.to_llm_format();
-
-                    Ok(CallToolResult {
-                        content: vec![Content::text(llm_output)],
-                        structured_content: None,
-                        is_error: Some(false),
-                        meta: None,
-                    })
+                    structured(
+                        &value,
+                        format!("Historical configuration for {node} at {}.", value.oid),
+                    )
                 }
-                _ => Err(McpError::new(
+                "diff_latest" => {
+                    let value = tools::diff_latest(&client, required_string(&args, "node")?)
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                    let text = value.to_llm_format();
+                    structured(&value, text)
+                }
+                "diff_configs" => {
+                    let value = tools::diff_configs(
+                        &client,
+                        required_string(&args, "node")?,
+                        required_string(&args, "version1")?,
+                        required_string(&args, "version2")?,
+                    )
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                    let text = value.to_llm_format();
+                    structured(&value, text)
+                }
+                "search_configs" => {
+                    let pattern = required_string(&args, "pattern")?;
+                    let value = tools::search_configs_with_options(
+                        &client,
+                        pattern,
+                        tools::SearchOptions {
+                            nodes: optional_strings(&args, "nodes"),
+                            case_sensitive: optional_bool(&args, "case_sensitive", true),
+                            literal: optional_bool(&args, "literal", false),
+                            context_before: optional_usize(&args, "context_before").unwrap_or(1),
+                            context_after: optional_usize(&args, "context_after").unwrap_or(1),
+                            limit: optional_usize(&args, "limit").unwrap_or(100),
+                            limit_per_node: optional_usize(&args, "limit_per_node"),
+                            offset: optional_usize(&args, "offset").unwrap_or(0),
+                        },
+                    )
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                    let text = value.to_llm_format();
+                    structured(&value, text)
+                }
+                "fetch_node_config" => {
+                    let value = backups
+                        .start(
+                            &client,
+                            required_string(&args, "node")?,
+                            optional_bool(&args, "wait", false),
+                            optional_usize(&args, "timeout_seconds").unwrap_or(60) as u64,
+                        )
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                    let text = value.message.clone();
+                    structured(&value, text)
+                }
+                "get_backup_status" => {
+                    let operation_id = required_string(&args, "operation_id")?;
+                    let value = backups
+                        .status(&client, operation_id)
+                        .await
+                        .map_err(Self::to_mcp_error)?
+                        .ok_or_else(|| {
+                            McpError::new(
+                                ErrorCode::INVALID_PARAMS,
+                                format!("Unknown or expired operation ID '{operation_id}'"),
+                                None,
+                            )
+                        })?;
+                    let text = value.message.clone();
+                    structured(&value, text)
+                }
+                "fetch_node_configs" => {
+                    let nodes = optional_strings(&args, "nodes")
+                        .filter(|nodes| !nodes.is_empty())
+                        .ok_or_else(|| {
+                            McpError::new(
+                                ErrorCode::INVALID_PARAMS,
+                                "Parameter 'nodes' must contain at least one node",
+                                None,
+                            )
+                        })?;
+                    let value = backups
+                        .start_batch(
+                            &client,
+                            nodes,
+                            optional_bool(&args, "wait", false),
+                            optional_usize(&args, "timeout_seconds").unwrap_or(60) as u64,
+                            optional_usize(&args, "concurrency").unwrap_or(5),
+                        )
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                    structured(
+                        &value,
+                        format!(
+                            "Queued {} backup operations ({} pending, {} failed).",
+                            value.requested, value.pending, value.failed
+                        ),
+                    )
+                }
+                "prioritize_node" => {
+                    let value = tools::prioritize_node(&client, required_string(&args, "node")?)
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                    structured(&value, value.message.clone())
+                }
+                "reload_sources" => {
+                    let value = tools::reload_sources(&client)
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                    structured(&value, value.message.clone())
+                }
+                name => Err(McpError::new(
                     ErrorCode::METHOD_NOT_FOUND,
-                    format!(
-                        "[Error] Unknown tool: '{}'\n\
-                         [Context] Attempted to call a tool that does not exist.\n\
-                         [Suggestions] Available tools: fetch_node_config, prioritize_node, reload_sources, diff_configs, search_configs\n\
-                         [Next Step] Use one of the available tool names.",
-                        tool_name
-                    ),
+                    format!("Unknown tool '{name}'"),
                     None,
                 )),
             }
@@ -879,138 +956,144 @@ impl ServerHandler for OxidizedServer {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tool_has_a_structured_output_schema_and_annotations() {
+        let read_only = [
+            "list_nodes",
+            "get_node",
+            "get_node_config",
+            "list_config_versions",
+            "get_config_version",
+            "diff_latest",
+            "diff_configs",
+            "search_configs",
+            "get_backup_status",
+        ];
+        let mut names = read_only.to_vec();
+        names.extend([
+            "fetch_node_config",
+            "fetch_node_configs",
+            "prioritize_node",
+            "reload_sources",
+        ]);
+
+        for name in names {
+            let definition = tool(
+                name,
+                "Test",
+                "Test contract",
+                json!({"type": "object", "properties": {}}),
+                read_only.contains(&name),
+            );
+            let schema = definition.output_schema.expect("output schema");
+            assert_eq!(schema.get("type"), Some(&json!("object")));
+            assert!(
+                schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| !properties.is_empty()),
+                "{name} must declare output fields"
+            );
+            let annotations = definition.annotations.expect("tool annotations");
+            assert_eq!(annotations.read_only_hint, Some(read_only.contains(&name)));
+            assert_eq!(annotations.destructive_hint, Some(false));
+        }
+    }
+
+    #[test]
+    fn structured_helper_retains_text_and_typed_content() {
+        let value = json!({"node": "router-1", "fresh": true});
+        let result = structured(&value, "Node router-1".to_string()).expect("tool result");
+
+        assert_eq!(result.structured_content, Some(value));
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn resource_and_tool_serialization_share_the_same_typed_value() {
+        let value = json!({"node": {"name": "router-1"}, "metadata": {"fresh": true}});
+        let tool_result = structured(&value, "Node router-1".to_string()).expect("tool result");
+        let resource_result =
+            resource("oxidized://node/router-1".to_string(), &value).expect("resource result");
+
+        let resource_text = match &resource_result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            _ => panic!("expected text resource"),
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(resource_text).expect("resource JSON"),
+            tool_result.structured_content.expect("structured content")
+        );
+    }
+
+    #[test]
+    fn tool_argument_validation_rejects_out_of_contract_values() {
+        let invalid_context = Some(
+            json!({"context_before": 51})
+                .as_object()
+                .expect("object")
+                .clone(),
+        );
+        assert!(validate_tool_arguments("search_configs", &invalid_context).is_err());
+
+        let invalid_nodes = Some(
+            json!({"nodes": ["router-1", 42]})
+                .as_object()
+                .expect("object")
+                .clone(),
+        );
+        assert!(validate_tool_arguments("fetch_node_configs", &invalid_nodes).is_err());
+
+        let invalid_wait = Some(json!({"wait": "yes"}).as_object().expect("object").clone());
+        assert!(validate_tool_arguments("fetch_node_config", &invalid_wait).is_err());
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize tracing subscriber with env filter support
-    // Default level: INFO, can be overridden via RUST_LOG env var
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr) // stdout reserved for MCP JSON-RPC
+        .with_writer(std::io::stderr)
         .init();
 
-    info!("mcp-oxidized v{} starting", VERSION);
+    if std::env::var("OXIDIZED_REDACT_SECRETS")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("false"))
+    {
+        warn!("OXIDIZED_REDACT_SECRETS=false: raw device secrets may be returned to MCP clients");
+    }
 
-    // Load configuration
     let config = match Config::load() {
-        Ok(cfg) => {
-            info!("Configuration loaded successfully");
-            info!("Oxidized URL: {}", cfg.oxidized_url);
-            if cfg.oxidized_user.is_some() {
-                info!("Authentication: enabled");
-            } else {
-                info!("Authentication: disabled (zero-config mode)");
-            }
-
-            // SSL verification warning (AC1) - only relevant for HTTPS
-            if cfg.oxidized_url.starts_with("https://") && !cfg.ssl_verify {
-                warn!("SSL certificate verification disabled");
-            }
-
-            // Custom headers info (AC2)
-            if !cfg.custom_headers.is_empty() {
-                info!(
-                    "Custom headers configured: {} header(s)",
-                    cfg.custom_headers.len()
-                );
-
-                // Authorization header priority warning (AC3)
-                let has_custom_auth = cfg
-                    .custom_headers
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("Authorization"));
-                if has_custom_auth && cfg.oxidized_user.is_some() {
-                    warn!("Custom Authorization header overrides OXIDIZED_USER/PASSWORD");
-                }
-            }
-
-            cfg
-        }
-        Err(e) => {
-            error!("Failed to load configuration: {}", e);
+        Ok(config) => config,
+        Err(error) => {
+            error!("Configuration error: {error}");
             std::process::exit(1);
         }
     };
-
-    // Create MCP server instance
     let server = match OxidizedServer::try_new(config) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to create server: {}", e);
+        Ok(server) => server,
+        Err(error) => {
+            error!("Failed to initialize Oxidized client: {error}");
             std::process::exit(1);
         }
     };
-
-    info!("MCP server initialized, starting stdio transport");
-    info!(
-        "Resources available: oxidized://nodes, oxidized://node/{{name}}, oxidized://node/{{name}}/config, oxidized://node/{{name}}/versions, oxidized://stats"
-    );
-    info!(
-        "Tools available: fetch_node_config, prioritize_node, reload_sources, diff_configs, search_configs"
-    );
-
-    // Run the server with stdio transport
-    // The serve() call returns a running service that we must keep alive with waiting()
+    info!("mcp-oxidized v{VERSION} starting");
     let service = match server.serve(rmcp::transport::stdio()).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Server error: {}", e);
+        Ok(service) => service,
+        Err(error) => {
+            error!("Failed to start MCP service: {error}");
             std::process::exit(1);
         }
     };
-
-    // Wait for the service to complete (keeps the connection alive)
-    if let Err(e) = service.waiting().await {
-        error!("Service error: {}", e);
+    if let Err(error) = service.waiting().await {
+        error!("Service error: {error}");
         std::process::exit(1);
-    }
-
-    info!("mcp-oxidized server shutting down");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // -------------------------------------------------------------------------
-    // decode_node_name Tests (Story 6-1)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_decode_node_name_with_space() {
-        let result = decode_node_name("router%201");
-        assert_eq!(result, "router 1");
-    }
-
-    #[test]
-    fn test_decode_node_name_with_slash() {
-        let result = decode_node_name("dc%2Fswitch-1");
-        assert_eq!(result, "dc/switch-1");
-    }
-
-    #[test]
-    fn test_decode_node_name_plain() {
-        let result = decode_node_name("switch-core-01");
-        assert_eq!(result, "switch-core-01");
-    }
-
-    #[test]
-    fn test_decode_node_name_utf8() {
-        let result = decode_node_name("routeur-%C3%A9t%C3%A9");
-        assert_eq!(result, "routeur-été");
-    }
-
-    #[test]
-    fn test_decode_node_name_invalid_utf8_returns_original() {
-        // Invalid percent-encoding should return original string
-        let result = decode_node_name("invalid%ZZ");
-        assert_eq!(result, "invalid%ZZ");
-    }
-
-    #[test]
-    fn test_decode_node_name_empty() {
-        let result = decode_node_name("");
-        assert_eq!(result, "");
     }
 }

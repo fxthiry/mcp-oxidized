@@ -61,6 +61,7 @@ use tracing::instrument;
 
 use crate::error::OxidizedError;
 use crate::oxidized::{CacheMetadata, CachedStats, Node, NodeVersion, OxidizedBackend};
+use crate::redaction::{RedactionMetadata, redact};
 
 // ============================================================================
 // Static Regex Patterns (Story 6-2: Performance optimization)
@@ -480,6 +481,8 @@ pub struct ConfigResponse {
     pub size: ConfigMetadata,
     /// Cache status metadata.
     pub metadata: CacheMetadata,
+    /// Secret masking performed on the returned configuration.
+    pub redaction: RedactionMetadata,
 }
 
 /// Response wrapper for version list (FR6).
@@ -506,6 +509,10 @@ pub struct VersionConfigResponse {
     pub oid: String,
     /// Size metadata for LLM context awareness.
     pub size: ConfigMetadata,
+    /// Historical content is always fetched directly from Oxidized.
+    pub metadata: CacheMetadata,
+    /// Secret masking performed on the returned configuration.
+    pub redaction: RedactionMetadata,
 }
 
 // ============================================================================
@@ -763,11 +770,13 @@ pub async fn get_node_config<B: OxidizedBackend>(
 ) -> Result<ConfigResponse, OxidizedError> {
     match backend.get_node_config(name).await {
         Ok((config, cache_meta)) => {
-            let size = ConfigMetadata::from_config(&config);
+            let redacted = redact(&config, backend.redaction_enabled());
+            let size = ConfigMetadata::from_config(&redacted.text);
             Ok(ConfigResponse {
-                config,
+                config: redacted.text,
                 size,
                 metadata: cache_meta,
+                redaction: redacted.redaction,
             })
         }
         Err(OxidizedError::NodeNotFound(node_name, _)) => {
@@ -801,6 +810,7 @@ pub struct ConfigSummaryResponse {
     pub summary: ConfigSummary,
     /// Cache status metadata.
     pub metadata: CacheMetadata,
+    pub redaction: RedactionMetadata,
 }
 
 /// Get configuration with advanced options (FR38-FR42).
@@ -843,12 +853,15 @@ pub async fn get_node_config_with_options<B: OxidizedBackend>(
 ) -> Result<ConfigWithOptionsResult, OxidizedError> {
     match backend.get_node_config(name).await {
         Ok((config, cache_meta)) => {
+            let redacted = redact(&config, backend.redaction_enabled());
+            let config = redacted.text;
             // Summary-only mode
             if summary_only {
                 let summary = extract_config_summary(&config);
                 return Ok(ConfigWithOptionsResult::Summary(ConfigSummaryResponse {
                     summary,
                     metadata: cache_meta,
+                    redaction: redacted.redaction,
                 }));
             }
 
@@ -870,6 +883,7 @@ pub async fn get_node_config_with_options<B: OxidizedBackend>(
                 config: final_config,
                 size,
                 metadata: cache_meta,
+                redaction: redacted.redaction,
             }))
         }
         Err(OxidizedError::NodeNotFound(node_name, _)) => {
@@ -959,11 +973,14 @@ pub async fn get_node_version<B: OxidizedBackend>(
 ) -> Result<VersionConfigResponse, OxidizedError> {
     match backend.get_node_version(name, oid).await {
         Ok(config) => {
-            let size = ConfigMetadata::from_config(&config);
+            let redacted = redact(&config, backend.redaction_enabled());
+            let size = ConfigMetadata::from_config(&redacted.text);
             Ok(VersionConfigResponse {
-                config,
+                config: redacted.text,
                 oid: oid.to_string(),
                 size,
+                metadata: CacheMetadata::miss(),
+                redaction: redacted.redaction,
             })
         }
         Err(OxidizedError::NodeNotFound(node_name, _)) => {
@@ -1844,6 +1861,7 @@ interface Ethernet1
             config: "hostname router1\n".to_string(),
             size: ConfigMetadata::from_config("hostname router1\n"),
             metadata: CacheMetadata::hit(),
+            redaction: RedactionMetadata::default(),
         };
 
         let json = serde_json::to_string(&response).expect("Should serialize ConfigResponse");
@@ -1864,6 +1882,7 @@ interface Ethernet1
         let response = ConfigSummaryResponse {
             summary,
             metadata: CacheMetadata::hit(),
+            redaction: RedactionMetadata::default(),
         };
 
         let json = serde_json::to_string(&response).expect("Should serialize");
@@ -1884,6 +1903,7 @@ interface Ethernet1
             config: "hostname router1\n".to_string(),
             size: ConfigMetadata::from_config("hostname router1\n"),
             metadata: CacheMetadata::hit(),
+            redaction: RedactionMetadata::default(),
         };
         let result = ConfigWithOptionsResult::Config(response);
 
@@ -1900,6 +1920,7 @@ interface Ethernet1
         let response = ConfigSummaryResponse {
             summary,
             metadata: CacheMetadata::miss(),
+            redaction: RedactionMetadata::default(),
         };
         let result = ConfigWithOptionsResult::Summary(response);
 
@@ -2097,6 +2118,8 @@ line vty 0 4
             config: "hostname router1\n".to_string(),
             oid: "abc123def456".to_string(),
             size: ConfigMetadata::from_config("hostname router1\n"),
+            metadata: CacheMetadata::miss(),
+            redaction: RedactionMetadata::default(),
         };
 
         let json =
@@ -2110,15 +2133,17 @@ line vty 0 4
     }
 
     #[test]
-    fn test_version_config_response_no_cache_metadata() {
+    fn test_version_config_response_has_fresh_metadata() {
         let response = VersionConfigResponse {
             config: "config data".to_string(),
             oid: "abc123".to_string(),
             size: ConfigMetadata::from_config("config data"),
+            metadata: CacheMetadata::miss(),
+            redaction: RedactionMetadata::default(),
         };
 
         let json = serde_json::to_string(&response).expect("Should serialize");
-        // VersionConfigResponse does NOT include cache metadata (historical data)
-        assert!(!json.contains("cache_hit"));
+        assert!(json.contains("\"cache_hit\":false"));
+        assert!(json.contains("\"fresh\":true"));
     }
 }

@@ -25,7 +25,7 @@ use mcp_oxidized::resources::{
 };
 use mcp_oxidized::tools;
 use mock_server::{
-    MockOxidizedServer, default_configs, default_nodes, default_versions, modified_config,
+    MockNode, MockOxidizedServer, default_configs, default_nodes, default_versions, modified_config,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -40,6 +40,16 @@ fn create_mock_client(mock_uri: &str) -> OxidizedClient {
         custom_headers: vec![],
     };
     OxidizedClient::try_new(&config).expect("Failed to create OxidizedClient")
+}
+
+fn backup_state(mut node: MockNode, status: &str, start: &str, end: &str, mtime: &str) -> MockNode {
+    node.status = status.to_string();
+    node.time = end.to_string();
+    node.mtime = mtime.to_string();
+    node.last.status = status.to_string();
+    node.last.start = start.to_string();
+    node.last.end = end.to_string();
+    node
 }
 
 // =============================================================================
@@ -113,6 +123,10 @@ async fn test_e2e_get_node_config_returns_text_with_metadata() {
         result.config.contains("hostname"),
         "Config should contain network device keywords"
     );
+    assert!(result.redaction.enabled);
+    assert!(result.redaction.replacement_count >= 4);
+    assert!(!result.config.contains("$1$xxxx$"));
+    assert!(!result.config.contains("community public"));
 }
 
 /// E2E test: get_node_versions returns sorted version list.
@@ -193,6 +207,173 @@ async fn test_e2e_fetch_node_config_triggers_backup() {
     assert!(result.message.contains("Backup triggered"));
 }
 
+#[tokio::test]
+async fn test_e2e_tracked_backup_completes_when_config_is_unchanged() {
+    let nodes = default_nodes();
+    let baseline = backup_state(
+        nodes[0].clone(),
+        "success",
+        "2026-01-01 00:00:00 UTC",
+        "2026-01-01 00:00:05 UTC",
+        "unchanged",
+    );
+    let pending = backup_state(
+        nodes[0].clone(),
+        "running",
+        "2026-01-01 00:01:00 UTC",
+        "",
+        "unchanged",
+    );
+    let completed = backup_state(
+        nodes[0].clone(),
+        "success",
+        "2026-01-01 00:01:00 UTC",
+        "2026-01-01 00:01:05 UTC",
+        "unchanged",
+    );
+    let mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(nodes)
+        .with_node_show_sequence("router-1", vec![baseline, pending, completed]);
+    mock.mount_all().await;
+    let client = create_mock_client(&mock.uri());
+    let registry = tools::BackupRegistry::default();
+
+    let result = registry
+        .start(&client, "router-1", true, 3)
+        .await
+        .expect("tracked backup should complete");
+
+    assert_eq!(result.completion_state, tools::BackupState::Succeeded);
+    assert!(result.completed);
+    assert!(!result.mtime_changed);
+    assert!(result.message.contains("unchanged"));
+}
+
+#[tokio::test]
+async fn test_e2e_tracked_backup_reports_failure_and_timeout() {
+    let nodes = default_nodes();
+    let baseline = nodes[0].clone();
+    let failed = backup_state(
+        nodes[0].clone(),
+        "failure",
+        "2026-01-01 00:01:00 UTC",
+        "2026-01-01 00:01:05 UTC",
+        "changed",
+    );
+    let failed_mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(nodes.clone())
+        .with_node_show_sequence("router-1", vec![baseline.clone(), failed]);
+    failed_mock.mount_all().await;
+    let client = create_mock_client(&failed_mock.uri());
+    let result = tools::BackupRegistry::default()
+        .start(&client, "router-1", true, 2)
+        .await
+        .expect("failed run should still return an operation");
+    assert_eq!(result.completion_state, tools::BackupState::Failed);
+
+    let timeout_mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(nodes)
+        .with_node_show_sequence("router-1", vec![baseline]);
+    timeout_mock.mount_all().await;
+    let client = create_mock_client(&timeout_mock.uri());
+    let result = tools::BackupRegistry::default()
+        .start(&client, "router-1", true, 1)
+        .await
+        .expect("timeout should still return an operation");
+    assert_eq!(result.completion_state, tools::BackupState::TimedOut);
+}
+
+#[tokio::test]
+async fn test_e2e_batch_backup_waits_with_bounded_concurrency() {
+    let nodes = default_nodes();
+    let router_done = backup_state(
+        nodes[0].clone(),
+        "success",
+        "2026-01-01 00:02:00 UTC",
+        "2026-01-01 00:02:05 UTC",
+        "router-new",
+    );
+    let switch_done = backup_state(
+        nodes[1].clone(),
+        "success",
+        "2026-01-01 00:02:00 UTC",
+        "2026-01-01 00:02:05 UTC",
+        "switch-new",
+    );
+    let mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(nodes.clone())
+        .with_node_show_sequence("router-1", vec![nodes[0].clone(), router_done])
+        .with_node_show_sequence("switch-1", vec![nodes[1].clone(), switch_done]);
+    mock.mount_all().await;
+    let client = create_mock_client(&mock.uri());
+
+    let result = tools::BackupRegistry::default()
+        .start_batch(
+            &client,
+            vec!["switch-1".to_string(), "router-1".to_string()],
+            true,
+            2,
+            2,
+        )
+        .await
+        .expect("batch should complete");
+
+    assert_eq!(result.requested, 2);
+    assert_eq!(result.completed, 2);
+    assert_eq!(result.failed, 0);
+    assert_eq!(result.operations[0].node, "router-1");
+    assert!(
+        result
+            .operations
+            .iter()
+            .all(|operation| operation.mtime_changed)
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_pending_backup_bypasses_configuration_cache() {
+    let mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(default_nodes())
+        .with_configs(default_configs())
+        .with_config_sequence(
+            "router-1",
+            vec![
+                "hostname old".to_string(),
+                "hostname early-stale".to_string(),
+                "hostname fresh".to_string(),
+            ],
+        );
+    mock.mount_all().await;
+    let client = create_mock_client(&mock.uri());
+
+    let (initial, initial_cache) =
+        mcp_oxidized::oxidized::OxidizedBackend::get_node_config(&client, "router-1")
+            .await
+            .expect("initial config");
+    assert_eq!(initial, "hostname old");
+    assert!(!initial_cache.cache_hit);
+
+    client.set_backup_pending("router-1", true).await;
+    let (early, early_cache) =
+        mcp_oxidized::oxidized::OxidizedBackend::get_node_config(&client, "router-1")
+            .await
+            .expect("early config");
+    let (fresh, fresh_cache) =
+        mcp_oxidized::oxidized::OxidizedBackend::get_node_config(&client, "router-1")
+            .await
+            .expect("fresh config");
+
+    assert_eq!(early, "hostname early-stale");
+    assert_eq!(fresh, "hostname fresh");
+    assert!(!early_cache.cache_hit);
+    assert!(!fresh_cache.cache_hit);
+}
+
 /// E2E test: prioritize_node updates queue position.
 #[tokio::test]
 async fn test_e2e_prioritize_node_updates_queue() {
@@ -238,14 +419,6 @@ async fn test_e2e_reload_sources_invalidates_cache() {
 /// E2E test: diff_configs compares two versions.
 #[tokio::test]
 async fn test_e2e_diff_configs_compares_versions() {
-    // Create configs with different versions
-    let mut configs = default_configs();
-    configs.insert(
-        "router-1-v1".to_string(),
-        default_configs().get("router-1").unwrap().clone(),
-    );
-    configs.insert("router-1-v2".to_string(), modified_config());
-
     let mut versions = default_versions();
     // First version points to original config
     versions[0].oid = "v1-oid".to_string();
@@ -256,7 +429,12 @@ async fn test_e2e_diff_configs_compares_versions() {
         .await
         .with_nodes(default_nodes())
         .with_versions("router-1", versions)
-        .with_configs(configs);
+        .with_version_config(
+            "router-1",
+            "v1-oid",
+            default_configs().get("router-1").unwrap(),
+        )
+        .with_version_config("router-1", "v2-oid", &modified_config());
     mock.mount_all().await;
 
     let client = create_mock_client(&mock.uri());
@@ -268,22 +446,51 @@ async fn test_e2e_diff_configs_compares_versions() {
     .await
     .expect("Test should complete within timeout");
 
-    // Diff might fail if configs aren't properly set up, but we're testing the flow
-    match result {
-        Ok(diff) => {
-            assert_eq!(diff.node, "router-1");
-            assert_eq!(diff.version1, "v1-oid");
-            assert_eq!(diff.version2, "v2-oid");
-            // LLM format should be available
-            let llm = diff.to_llm_format();
-            assert!(llm.contains("Configuration Diff"));
-        }
-        Err(e) => {
-            // If version view isn't properly mocked, we might get an error
-            // This is acceptable for the mock - real test is in integration_real_api.rs
-            println!("diff_configs returned error (acceptable in mock): {:?}", e);
-        }
-    }
+    let diff = result.expect("diff should succeed");
+    assert_eq!(diff.node, "router-1");
+    assert_eq!(diff.version1, "v1-oid");
+    assert_eq!(diff.version2, "v2-oid");
+    assert!(diff.to_llm_format().contains("Configuration Diff"));
+    assert!(!diff.unified_diff.contains("$1$xxxx$"));
+}
+
+#[tokio::test]
+async fn test_e2e_historical_config_and_secret_only_diff_are_redacted() {
+    let versions = default_versions();
+    let old_oid = versions[1].oid.clone();
+    let new_oid = versions[0].oid.clone();
+    let old = "hostname router-1\nsnmp-server community old-secret ro\n";
+    let new = "hostname router-1\nsnmp-server community new-secret ro\n";
+    let mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(default_nodes())
+        .with_versions("router-1", versions)
+        .with_version_config("router-1", &old_oid, old)
+        .with_version_config("router-1", &new_oid, new);
+    mock.mount_all().await;
+    let client = create_mock_client(&mock.uri());
+
+    let historical = mcp_oxidized::resources::get_node_version(&client, "router-1", &old_oid)
+        .await
+        .expect("historical config");
+    assert!(historical.metadata.fresh);
+    assert!(historical.config.contains("<redacted>"));
+    assert!(!historical.config.contains("old-secret"));
+
+    let diff = tools::diff_configs(&client, "router-1", &old_oid, &new_oid)
+        .await
+        .expect("secret-only diff");
+    assert!(!diff.identical);
+    assert!(
+        diff.unified_diff
+            .contains("-snmp-server community <redacted> ro")
+    );
+    assert!(
+        diff.unified_diff
+            .contains("+snmp-server community <redacted> ro")
+    );
+    assert!(!diff.unified_diff.contains("old-secret"));
+    assert!(!diff.unified_diff.contains("new-secret"));
 }
 
 /// E2E test: search_configs finds patterns in configurations.
@@ -340,6 +547,82 @@ async fn test_e2e_search_configs_uses_prefilter() {
     // The mock conf_search endpoint filters nodes
     // Nodes without "interface" won't be searched (optimization)
     assert!(result.nodes_searched <= 3);
+}
+
+#[tokio::test]
+async fn test_e2e_search_zero_prefilter_matches_has_correct_counters() {
+    let mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(default_nodes())
+        .with_configs(default_configs());
+    mock.mount_all().await;
+    let client = create_mock_client(&mock.uri());
+
+    let result = tools::search_configs_with_options(
+        &client,
+        "definitely-not-present",
+        tools::SearchOptions::default(),
+    )
+    .await
+    .expect("zero-match search");
+
+    assert_eq!(result.nodes_searched, 3);
+    assert_eq!(result.configs_fetched, 0);
+    assert_eq!(result.nodes_with_matches, 0);
+    assert_eq!(result.nodes_returned, 0);
+}
+
+#[tokio::test]
+async fn test_e2e_search_intersection_pagination_and_redaction_are_deterministic() {
+    let mut configs = default_configs();
+    configs.insert(
+        "router-1".to_string(),
+        "description target one\nsnmp-server community target ro\ndescription target two\n"
+            .to_string(),
+    );
+    let mock = MockOxidizedServer::start()
+        .await
+        .with_nodes(default_nodes())
+        .with_configs(configs);
+    mock.mount_all().await;
+    let client = create_mock_client(&mock.uri());
+
+    let result = tools::search_configs_with_options(
+        &client,
+        "target",
+        tools::SearchOptions {
+            nodes: Some(vec![
+                "router-1".to_string(),
+                "fw-1".to_string(),
+                "missing".to_string(),
+            ]),
+            context_before: 0,
+            context_after: 0,
+            offset: 1,
+            limit: 1,
+            ..tools::SearchOptions::default()
+        },
+    )
+    .await
+    .expect("paginated search");
+
+    assert_eq!(result.nodes_searched, 2);
+    assert_eq!(result.configs_fetched, 1);
+    assert_eq!(result.total_matches, 3);
+    assert_eq!(result.shown_matches, 1);
+    assert_eq!(result.offset, 1);
+    assert!(result.has_more);
+    assert_eq!(result.results[0].node, "router-1");
+    assert_eq!(
+        result.results[0].matches[0].content,
+        "snmp-server community <redacted> ro"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("missing"))
+    );
 }
 
 // =============================================================================
@@ -512,6 +795,7 @@ async fn test_e2e_config_options_summary_works() {
         ConfigWithOptionsResult::Summary(summary_response) => {
             assert!(summary_response.summary.total_lines > 0);
             assert!(!summary_response.summary.vendor_hint.is_empty());
+            assert!(summary_response.redaction.replacement_count >= 4);
 
             // LLM format should work
             let llm = summary_response.summary.to_llm_format();

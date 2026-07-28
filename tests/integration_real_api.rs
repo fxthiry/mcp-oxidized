@@ -129,8 +129,11 @@ async fn test_get_node_returns_details() {
         "Returned node should match requested name"
     );
 
-    // First call for this node should be cache miss
-    assert!(!metadata.cache_hit, "First call should be cache miss");
+    // get_nodes hydrates the per-node cache, so this lookup should be a hit.
+    assert!(
+        metadata.cache_hit,
+        "Node list should hydrate the node cache"
+    );
 }
 
 /// Test that get_node_config() returns configuration text.
@@ -161,6 +164,11 @@ async fn test_get_node_config_returns_text() {
         assert!(
             !config.is_empty(),
             "Configuration should not be empty for a successful node"
+        );
+        assert_ne!(
+            config.trim(),
+            "node not found",
+            "Grouped node configuration must be fetched using its full path"
         );
 
         // First call should be cache miss
@@ -1528,7 +1536,7 @@ async fn test_search_configs_llm_format_structure() {
             llm_output.contains("**Line"),
             "Should show line numbers for matches"
         );
-        assert!(llm_output.contains(">>>"), "Should have match marker");
+        assert!(llm_output.contains("\n> "), "Should have match marker");
     }
 
     println!("LLM Output:\n{}", llm_output);

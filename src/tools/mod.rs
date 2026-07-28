@@ -45,17 +45,27 @@
 //! println!("{}", result.message);
 //! ```
 
+mod backup;
 mod diff_configs;
 mod fetch_node_config;
 mod prioritize_node;
+mod read;
 mod reload_sources;
 mod search_configs;
 
+pub use backup::{BackupMetadata, BackupOperation, BackupRegistry, BackupState, BatchBackupResult};
 pub use diff_configs::{DiffResult, diff_configs};
 pub use fetch_node_config::fetch_node_config;
 pub use prioritize_node::prioritize_node;
+pub use read::{
+    ConfigMode, NodeConfigToolResponse, NodeFilters, diff_latest, get_config_version, get_node,
+    get_node_config, list_config_versions, list_nodes,
+};
 pub use reload_sources::reload_sources;
-pub use search_configs::{NodeMatches, SearchMatch, SearchResult, search_configs};
+pub use search_configs::{
+    MAX_CONTEXT_LINES, NodeMatches, SearchMatch, SearchOptions, SearchResult, search_configs,
+    search_configs_with_options,
+};
 
 use crate::error::OxidizedError;
 use crate::oxidized::{OxidizedBackend, OxidizedClient};

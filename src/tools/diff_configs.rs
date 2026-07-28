@@ -19,6 +19,7 @@ use tracing::instrument;
 
 use crate::error::OxidizedError;
 use crate::oxidized::{OxidizedBackend, OxidizedClient};
+use crate::redaction::{RedactionMetadata, redact_preserving_lines};
 
 use super::enrich_node_not_found;
 
@@ -88,6 +89,7 @@ pub struct DiffResult {
     pub modifications: Vec<Modification>,
     /// Unified diff output for raw access
     pub unified_diff: String,
+    pub redaction: RedactionMetadata,
 }
 
 impl DiffResult {
@@ -399,12 +401,27 @@ pub async fn diff_configs(
             deletions: vec![],
             modifications: vec![],
             unified_diff: String::new(),
+            redaction: RedactionMetadata {
+                enabled: backend.redaction_enabled(),
+                replacement_count: 0,
+            },
         });
     }
 
     // Compute diff using Myers algorithm
-    let (additions, deletions, modifications, summary, unified_diff) =
+    let (mut additions, mut deletions, mut modifications, summary, mut unified_diff) =
         compute_diff(&config1, &config2);
+    let redaction_enabled = backend.redaction_enabled();
+    let mut replacement_count = 0usize;
+    replacement_count += redact_line_changes(&mut additions, redaction_enabled);
+    replacement_count += redact_line_changes(&mut deletions, redaction_enabled);
+    for modification in &mut modifications {
+        replacement_count += redact_string_lines(&mut modification.old_content, redaction_enabled);
+        replacement_count += redact_string_lines(&mut modification.new_content, redaction_enabled);
+    }
+    let redacted = redact_unified_diff(&unified_diff, redaction_enabled);
+    unified_diff = redacted.0;
+    replacement_count += redacted.1;
 
     tracing::info!(
         node = %node,
@@ -424,7 +441,57 @@ pub async fn diff_configs(
         deletions,
         modifications,
         unified_diff,
+        redaction: RedactionMetadata {
+            enabled: redaction_enabled,
+            replacement_count,
+        },
     })
+}
+
+fn redact_line_changes(changes: &mut [LineChange], enabled: bool) -> usize {
+    let mut contents: Vec<String> = changes
+        .iter()
+        .map(|change| change.content.clone())
+        .collect();
+    let count = redact_string_lines(&mut contents, enabled);
+    for (change, content) in changes.iter_mut().zip(contents) {
+        change.content = content;
+    }
+    count
+}
+
+fn redact_string_lines(lines: &mut [String], enabled: bool) -> usize {
+    let redacted = redact_preserving_lines(&lines.join("\n"), enabled);
+    for (line, content) in lines.iter_mut().zip(redacted.text.lines()) {
+        *line = content.to_string();
+    }
+    redacted.redaction.replacement_count
+}
+
+fn redact_unified_diff(diff: &str, enabled: bool) -> (String, usize) {
+    let marked: Vec<(String, &str)> = diff
+        .lines()
+        .map(|line| match line.chars().next() {
+            Some(marker @ ('+' | '-' | ' ')) => (marker.to_string(), &line[marker.len_utf8()..]),
+            _ => (String::new(), line),
+        })
+        .collect();
+    let contents = marked
+        .iter()
+        .map(|(_, content)| *content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let redacted = redact_preserving_lines(&contents, enabled);
+    let lines: Vec<String> = marked
+        .into_iter()
+        .zip(redacted.text.lines())
+        .map(|((marker, _), content)| format!("{marker}{content}"))
+        .collect();
+    let mut output = lines.join("\n");
+    if diff.ends_with('\n') {
+        output.push('\n');
+    }
+    (output, redacted.redaction.replacement_count)
 }
 
 // ============================================================================
@@ -659,6 +726,7 @@ end"#;
             deletions: vec![],
             modifications: vec![],
             unified_diff: String::new(),
+            redaction: RedactionMetadata::default(),
         };
 
         let output = result.to_llm_format();
@@ -699,6 +767,7 @@ end"#;
             }],
             unified_diff: "@@ -1,3 +1,4 @@\n line1\n-old value\n+new value\n line3\n+new line"
                 .to_string(),
+            redaction: RedactionMetadata::default(),
         };
 
         let output = result.to_llm_format();
@@ -745,6 +814,7 @@ end"#;
                 new_content: vec!["new".to_string()],
             }],
             unified_diff: "@@ -1 +1 @@\n-old\n+new".to_string(),
+            redaction: RedactionMetadata::default(),
         };
 
         let output = result.to_llm_format();
@@ -777,6 +847,7 @@ end"#;
             deletions: vec![],
             modifications: vec![],
             unified_diff: "+test".to_string(),
+            redaction: RedactionMetadata::default(),
         };
 
         let json = serde_json::to_string(&result).expect("Should serialize");
